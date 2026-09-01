@@ -53,7 +53,7 @@ def script_screen(session: Session) -> None:
         if status:
             panel.append(ui.c("  " + status.lstrip("! "),
                               "bad" if status.startswith("!") else "ok"))
-        panel.append(ui.c(f"  строки {top + 1}–{top + len(shown)} из {len(lines)}"
+        panel.append(ui.c(f"  строки {top + 1}-{top + len(shown)} из {len(lines)}"
                           f"   ·   s сохранить   ·   {t('keys_scroll')}", "dim"))
         ui.draw(ui.panel(panel, ui.WIDE))
         status = ""
@@ -76,7 +76,7 @@ def script_screen(session: Session) -> None:
 def save_script(session: Session, text: str | None = None) -> str:
     """Write the script out where the operator asks. Returns a status line."""
     if not session.profile:
-        return "! нечего сохранять — трафик не собран"
+        return "! нечего сохранять - трафик не собран"
     text = text if text is not None else codegen.generate(session.profile)
     default = session.script_dir / codegen.script_name(session.profile)
     typed = ui.ask_line(t("script_where", default=default))

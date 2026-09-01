@@ -1,4 +1,4 @@
-"""The TRex engine — declared, not yet implemented.
+"""The TRex engine - declared, not yet implemented.
 
 Where it fits: Scapy paces through the kernel and gives out somewhere in the
 tens of thousands of frames a second. Above that a run tells you about the
@@ -41,7 +41,7 @@ class TrexEngine(Declared):
     key = "trex"
     title = "TRex"
     hint = "DPDK, линейная скорость, честные потери"
-    layers = "L2–L4"
+    layers = "L2-L4"
     ready = False
     status = "ещё не реализован"
     file_suffix = ".py"
@@ -56,5 +56,5 @@ class TrexEngine(Declared):
         if not host.has_trex:
             out.append("на цели не видно каталога TRex (обычно /opt/trex)")
         if not (host.is_root or host.can_sudo):
-            out.append("нет root и sudo без пароля — TRex без них не поднять")
+            out.append("нет root и sudo без пароля - TRex без них не поднять")
         return out

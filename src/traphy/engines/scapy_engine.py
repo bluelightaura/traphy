@@ -26,7 +26,7 @@ class ScapyEngine:
     key = "scapy"
     title = "Scapy"
     hint = "любой Linux с NIC и root"
-    layers = "L2–L4"
+    layers = "L2-L4"
     ready = True
     status = ""
     file_suffix = ".py"
@@ -67,9 +67,9 @@ class ScapyEngine:
     def blockers(self, host: HostInfo) -> list[str]:
         out: list[str] = []
         if not host.has_scapy:
-            out.append("на цели нет Scapy — поставь: pip install scapy")
+            out.append("на цели нет Scapy - поставь: pip install scapy")
         if not (host.is_root or host.can_sudo):
-            out.append("нет root и sudo без пароля — сырой сокет не открыть")
+            out.append("нет root и sudo без пароля - сырой сокет не открыть")
         if not any(i.is_up for i in host.usable_ifaces()):
             out.append("ни один подходящий интерфейс не поднят")
         return out

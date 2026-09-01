@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen = sub.add_parser("gen", help="сгенерировать Scapy-скрипт")
     gen.add_argument("profile", help="имя пресета или путь к profile.json")
     gen.add_argument("-o", "--out", metavar="FILE",
-                     help="куда записать (по умолчанию — в stdout)")
+                     help="куда записать (по умолчанию - в stdout)")
 
     run = sub.add_parser("run", help="прогнать профиль на цели")
     run.add_argument("profile", help="имя пресета или путь к profile.json")
@@ -90,7 +90,7 @@ def load_profile(name: str, profile_dir: Path) -> Profile:
             try:
                 return Profile.load(candidate)
             except (OSError, ValueError) as exc:
-                raise SystemExit(f"{candidate}: не читается — {exc}") from exc
+                raise SystemExit(f"{candidate}: не читается - {exc}") from exc
     known = ", ".join(presets.keys())
     raise SystemExit(f"не нашёл профиль «{name}». Пресеты: {known}")
 
@@ -201,7 +201,7 @@ def cmd_targets(_args: argparse.Namespace) -> int:
     store = TargetStore()
     names = store.list()
     if not names:
-        print("сохранённых целей нет — открой меню и настрой первую")
+        print("сохранённых целей нет - открой меню и настрой первую")
         return 0
     for name in names:
         target = store.try_load(name)

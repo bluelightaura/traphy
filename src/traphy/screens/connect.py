@@ -90,7 +90,7 @@ def _fields(session: Session, d: Target) -> list[Field]:
     def strict_toggle(_v: str) -> str:
         d.strict_host_key = not d.strict_host_key
         if not d.strict_host_key:
-            return ("! строгая проверка снята — ключ хоста не сверяется, "
+            return ("! строгая проверка снята - ключ хоста не сверяется, "
                     "по пути может встать кто угодно")
         return ""
 
@@ -116,10 +116,10 @@ def _fields(session: Session, d: Target) -> list[Field]:
         Field("name", t("f_name"), lambda: d.name, name_set),
         Field("engine", t("f_engine"), lambda: _engine_label(d), engine_set,
               kind="pick", options=engines.options(),
-              hint="Scapy — L2–L4 своими кадрами; остальные пока заявлены"),
+              hint="Scapy - L2-L4 своими кадрами; остальные пока заявлены"),
         Field("use_ssh", t("f_use_ssh"), lambda: _yn(d.use_ssh), ssh_toggle,
               kind="toggle",
-              hint="выключено — трафик уходит с этой машины"),
+              hint="выключено - трафик уходит с этой машины"),
         Field("host", t("f_host"), lambda: d.host or t("unset"), host_set,
               visible=remote),
         Field("ssh_user", t("f_ssh_user"), lambda: d.ssh_user or t("unset"),
@@ -136,7 +136,7 @@ def _fields(session: Session, d: Target) -> list[Field]:
         Field("sudo", t("f_sudo"), lambda: _yn(d.use_sudo), sudo_toggle,
               kind="toggle", hint="сырой сокет без root не открыть"),
         Field("tx", t("f_tx"), lambda: _iface_label(session, d.tx_iface), tx_set,
-              hint="↵ — список интерфейсов с цели"),
+              hint="↵ - список интерфейсов с цели"),
         Field("rx", t("f_rx"),
               lambda: _iface_label(session, d.rx_iface) if d.rx_iface else t("rx_unset"),
               rx_set,
@@ -182,7 +182,7 @@ def _pick_iface(session: Session, d: Target, which: str) -> str:
         typed = ui.ask_line(f"{label}: ")
         if typed:
             _assign(d, which, typed.strip())
-        return "! связи с целью нет — список интерфейсов не получен" if not typed else ""
+        return "! связи с целью нет - список интерфейсов не получен" if not typed else ""
 
     ifaces = session.host.usable_ifaces()
     options = [(i.name, i.describe()) for i in ifaces]
@@ -217,9 +217,9 @@ def _iface_warning(session: Session, d: Target, which: str) -> str:
         return ""
     found = _find(session, name)
     if found and not found.is_up:
-        return f"! {name} не поднят — трафик по нему не пойдёт"
+        return f"! {name} не поднят - трафик по нему не пойдёт"
     if which == "rx" and name == d.tx_iface:
-        return ("! приём и отправка на одном интерфейсе — "
+        return ("! приём и отправка на одном интерфейсе - "
                 "посчитается собственный трафик, а не то, что вернулось")
     return ""
 
@@ -244,7 +244,7 @@ def _connect_with_progress(session: Session, draft: Target) -> str:
         answer = ui.notice([
             ui.c(f"  Ключа {draft.host} нет в known_hosts", "warn"), "",
             "  Строгая проверка откажет в соединении. Подключись один раз",
-            f"  вручную — ssh {draft.ssh_user}@{draft.host} — и вернись сюда.",
+            f"  вручную - ssh {draft.ssh_user}@{draft.host} - и вернись сюда.",
             "", ui.c("  " + t("keys_any"), "dim"),
         ], ui.WIDE)
         del answer

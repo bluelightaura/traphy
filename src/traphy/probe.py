@@ -45,7 +45,7 @@ class Iface:
         return not self.name.startswith(BORING_PREFIXES)
 
     def describe(self) -> str:
-        bits = [self.mac or "—"]
+        bits = [self.mac or "-"]
         bits.append("up" if self.is_up else self.state or "?")
         if self.speed_mbit:
             bits.append(f"{self.speed_mbit} Мбит/с")

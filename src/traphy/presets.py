@@ -37,7 +37,7 @@ def l2_ethernet(rate_pps: float = 1000) -> Profile:
         rate_value=rate_pps,
     )
     return Profile(name="l2_ethernet",
-                   description="Чистый L2 Ethernet — коммутация",
+                   description="Чистый L2 Ethernet - коммутация",
                    streams=[s])
 
 
@@ -50,7 +50,7 @@ def l2_vlan(vlan: int = 100, rate_pps: float = 1000) -> Profile:
         rate_value=rate_pps,
     )
     return Profile(name="l2_vlan",
-                   description=f"L2 с тегом VLAN {vlan} — транк",
+                   description=f"L2 с тегом VLAN {vlan} - транк",
                    streams=[s])
 
 
@@ -63,7 +63,7 @@ def l3_ip(rate_pps: float = 1000) -> Profile:
         rate_type=RateType.PPS,
         rate_value=rate_pps,
     )
-    return Profile(name="l3_ip", description="L3 IPv4 — маршрутизация",
+    return Profile(name="l3_ip", description="L3 IPv4 - маршрутизация",
                    streams=[s])
 
 
@@ -75,7 +75,7 @@ def l4_udp(rate_pps: float = 1000) -> Profile:
         rate_type=RateType.PPS,
         rate_value=rate_pps,
     )
-    return Profile(name="l4_udp", description="L4 UDP — фиксированные порты",
+    return Profile(name="l4_udp", description="L4 UDP - фиксированные порты",
                    streams=[s])
 
 
@@ -87,7 +87,7 @@ def l4_tcp(rate_pps: float = 1000) -> Profile:
         rate_type=RateType.PPS,
         rate_value=rate_pps,
     )
-    return Profile(name="l4_tcp", description="L4 TCP — таблицы сессий",
+    return Profile(name="l4_tcp", description="L4 TCP - таблицы сессий",
                    streams=[s])
 
 
@@ -150,7 +150,7 @@ def table_stress(rate_pps: float = 10000) -> Profile:
                            min_value="16.0.0.1", max_value="16.0.255.254")],
     )
     return Profile(name="table_stress",
-                   description="Случайные источники на высоком pps — таблицы",
+                   description="Случайные источники на высоком pps - таблицы",
                    streams=[s])
 
 
@@ -168,7 +168,7 @@ def burst_probe(rate_pps: float = 20000) -> Profile:
         ibg_usec=50000.0,
     )
     return Profile(name="burst_probe",
-                   description="Очереди с паузами — буферы и микробёрсты",
+                   description="Очереди с паузами - буферы и микробёрсты",
                    streams=[s])
 
 
@@ -180,8 +180,8 @@ PRESETS: dict[str, tuple[str, str, Callable[[], Profile]]] = {
     "l3_ip": ("L3 IPv4", "маршрутизация", l3_ip),
     "l4_udp": ("L4 UDP", "фиксированные порты", l4_udp),
     "l4_tcp": ("L4 TCP", "таблицы сессий", l4_tcp),
-    "imix": ("IMIX", "64/590/1514 — как живой трафик", imix),
-    "ip_sweep": ("Перебор IP", "/24 по назначению — FIB", ip_sweep),
+    "imix": ("IMIX", "64/590/1514 - как живой трафик", imix),
+    "ip_sweep": ("Перебор IP", "/24 по назначению - FIB", ip_sweep),
     "port_sweep": ("Перебор портов", "сессии, NAT, ACL", port_sweep),
     "table_stress": ("Стресс таблиц", "случайные источники, высокий pps", table_stress),
     "burst_probe": ("Очередями", "буферы и микробёрсты", burst_probe),

@@ -219,11 +219,11 @@ class SshTransport(Transport):
             )
         except paramiko.AuthenticationException as exc:
             raise TransportError(
-                f"{user}@{host}: логин не принят — проверь ключ или агента") from exc
+                f"{user}@{host}: логин не принят - проверь ключ или агента") from exc
         except paramiko.SSHException as exc:
             raise TransportError(_ssh_hint(host, user, exc)) from exc
         except OSError as exc:
-            raise TransportError(f"{host}:{port} недоступен — {exc}") from exc
+            raise TransportError(f"{host}:{port} недоступен - {exc}") from exc
 
     def describe(self) -> str:
         return f"SSH {self.user}@{self.host}:{self.port}"
@@ -263,7 +263,7 @@ def _ssh_hint(host: str, user: str, exc: Exception) -> str:
     """Turn paramiko's host-key refusal into something actionable."""
     text = str(exc)
     if "not found in known_hosts" in text or "Server" in text:
-        return (f"ключ хоста {host} не в known_hosts — подключись один раз "
+        return (f"ключ хоста {host} не в known_hosts - подключись один раз "
                 f"вручную (ssh {user}@{host}) или сними строгую проверку в цели")
     return f"SSH к {host}: {text}"
 

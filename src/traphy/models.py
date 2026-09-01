@@ -321,7 +321,7 @@ class Profile:
         if not self.streams:
             problems.append("в профиле нет потоков")
         elif not self.enabled_streams:
-            problems.append("все потоки выключены — слать нечего")
+            problems.append("все потоки выключены - слать нечего")
 
         seen: set[str] = set()
         for i, s in enumerate(self.streams):
@@ -344,9 +344,9 @@ def _stream_problems(s: Stream, tag: str) -> list[str]:
     if s.rate_type is RateType.PERCENT and s.rate_value > 100:
         out.append(f"{tag}: процент линии больше 100")
     if s.packet.frame_size < MIN_FRAME:
-        out.append(f"{tag}: кадр меньше {MIN_FRAME} B — короче минимального Ethernet")
+        out.append(f"{tag}: кадр меньше {MIN_FRAME} B - короче минимального Ethernet")
     if s.packet.frame_size > MAX_FRAME:
-        out.append(f"{tag}: кадр больше {MAX_FRAME} B — за пределом jumbo")
+        out.append(f"{tag}: кадр больше {MAX_FRAME} B - за пределом jumbo")
     if s.packet.vlan is not None and not 0 <= s.packet.vlan <= 4095:
         out.append(f"{tag}: VLAN вне диапазона 0..4095")
     if s.tx_mode is not TxMode.CONTINUOUS and s.pkts_per_burst <= 0:

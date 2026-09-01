@@ -88,7 +88,7 @@ def script_name(profile: Profile) -> str:
 # Header
 # --------------------------------------------------------------------------- #
 def _header(profile: Profile, skipped: list[str], tag: str) -> str:
-    desc = profile.description or "—"
+    desc = profile.description or "-"
     note = ""
     if skipped:
         note = f"# Выключенные потоки не вошли: {', '.join(skipped)}\n"
@@ -120,7 +120,7 @@ EXPAND_CAP = {EXPAND_CAP}
 RANDOM_POOL = {RANDOM_POOL}
 
 # Ширина отрезка, которым скрипт нарезает отправку. Спать после каждого
-# пакета на высоком pps нельзя — планировщик не даст такой точности; поэтому
+# пакета на высоком pps нельзя - планировщик не даст такой точности; поэтому
 # шлём пачку на отрезок и досыпаем остаток.
 SLICE = 0.01
 
@@ -477,7 +477,7 @@ def main(argv=None):
 
     if not STREAMS:
         emit(quiet, ev="error", msg="в профиле нет включённых потоков")
-        print("нет потоков — слать нечего", file=sys.stderr)
+        print("нет потоков - слать нечего", file=sys.stderr)
         return 2
 
     built = build_all(quiet)
@@ -489,7 +489,7 @@ def main(argv=None):
          truncated=list(_TRUNCATED))
 
     for line in _TRUNCATED:
-        print("диапазон урезан — " + line, file=sys.stderr)
+        print("диапазон урезан - " + line, file=sys.stderr)
 
     if args.pcap:
         wrpcap(args.pcap, [f for _, fs, _ in built for f in fs])
@@ -501,13 +501,13 @@ def main(argv=None):
             print("   " + fs[0].summary())
         emit(quiet, ev="done", tx=0, rx=0, seconds=0.0, tx_bytes=0,
              achieved_pps=0.0, rx_source="none", reliable=False,
-             note="сухой прогон — в кабель ничего не ушло")
+             note="сухой прогон - в кабель ничего не ушло")
         return 0
 
     try:
         result = run(args, built, quiet)
     except PermissionError:
-        emit(quiet, ev="error", msg="нет прав на сырой сокет — нужен root")
+        emit(quiet, ev="error", msg="нет прав на сырой сокет - нужен root")
         print("нужен root: sudo " + " ".join(sys.argv), file=sys.stderr)
         return 13
     except OSError as exc:
@@ -521,7 +521,7 @@ def main(argv=None):
         share = (loss / result["tx"] * 100.0) if result["tx"] else 0.0
         tail = "принято %d, потеряно %d (%.2f%%)" % (result["rx"], loss, share)
     else:
-        tail = "приём не измерялся — задай --rx-iface"
+        tail = "приём не измерялся - задай --rx-iface"
     print("отправлено %d кадров за %.1f c (%.0f pps), %s"
           % (result["tx"], result["seconds"], result["achieved_pps"], tail))
     return 0

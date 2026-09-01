@@ -105,14 +105,14 @@ class RunResult:
         """Everything about this result a reader should not have to infer."""
         out: list[str] = []
         if not self.reliable:
-            out.append("приём не измерялся — колонка потерь ничего не значит; "
+            out.append("приём не измерялся - колонка потерь ничего не значит; "
                        "задай интерфейс приёма в настройке цели")
         if self.rate_shortfall > 10:
             out.append(f"выдано {self.achieved_pps:.0f} pps из "
                        f"{self.requested_pps:.0f} запрошенных "
-                       f"(-{self.rate_shortfall:.0f}%) — Scapy упёрся, "
+                       f"(-{self.rate_shortfall:.0f}%) - Scapy упёрся, "
                        f"устройство на этой скорости не проверено")
-        out.extend(f"диапазон урезан — {t}" for t in self.truncated)
+        out.extend(f"диапазон урезан - {t}" for t in self.truncated)
         if self.rc != 0:
             why = f": {self.note}" if self.note else ""
             out.append(f"скрипт завершился с кодом {self.rc}{why}")

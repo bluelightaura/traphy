@@ -75,7 +75,7 @@ class Declared:
 
     def _refuse(self) -> EngineNotReady:
         return EngineNotReady(
-            f"движок «{self.title}» {self.status} — возьми Scapy "
+            f"движок «{self.title}» {self.status} - возьми Scapy "
             f"или дождись реализации")
 
     def generate(self, profile, tag):

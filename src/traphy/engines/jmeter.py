@@ -1,4 +1,4 @@
-"""The JMeter engine — declared, not yet implemented.
+"""The JMeter engine - declared, not yet implemented.
 
 Where it fits: the Scapy and TRex engines answer "does this device forward
 frames, and at what rate does it stop". JMeter answers a different question -
@@ -48,7 +48,7 @@ class JMeterEngine(Declared):
     def blockers(self, host: HostInfo) -> list[str]:
         out = [f"движок JMeter {self.status}"]
         if not host.has_java:
-            out.append("на цели нет java — JMeter без JVM не запустится")
+            out.append("на цели нет java - JMeter без JVM не запустится")
         if not host.has_jmeter:
             out.append("на цели не найден jmeter в PATH")
         return out

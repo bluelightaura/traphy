@@ -91,10 +91,10 @@ class Target:
     def endpoint(self) -> str:
         """A short "where am I sending from" for the menu's header line."""
         if self.is_local:
-            return f"локально · {self.tx_iface or '—'}"
+            return f"локально · {self.tx_iface or '-'}"
         user = f"{self.ssh_user}@" if self.ssh_user else ""
         port = f":{self.ssh_port}" if self.ssh_port != 22 else ""
-        return f"{user}{self.host}{port} · {self.tx_iface or '—'}"
+        return f"{user}{self.host}{port} · {self.tx_iface or '-'}"
 
     def measures_rx(self) -> bool:
         """Whether a run can report loss at all, or only what it sent.
@@ -146,7 +146,7 @@ class Target:
         if not self.tx_iface.strip():
             problems.append("не выбран интерфейс отправки")
         if self.rx_iface and self.rx_iface == self.tx_iface and not self.is_local:
-            problems.append("приём и отправка на одном интерфейсе — "
+            problems.append("приём и отправка на одном интерфейсе - "
                             "потери мерить нечем")
         if self.link_mbit <= 0:
             problems.append("скорость линии должна быть больше нуля")
@@ -261,7 +261,7 @@ def probe_reachable(target: Target, timeout: float = 4.0,
     if target.is_local:
         if on_progress:
             on_progress(1.0)
-        return True, "локальный запуск — сеть не нужна"
+        return True, "локальный запуск - сеть не нужна"
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
@@ -276,7 +276,7 @@ def probe_reachable(target: Target, timeout: float = 4.0,
     except TimeoutError:
         return False, f"{target.host}:{target.ssh_port} не отвечает за {timeout:g} c"
     except OSError as exc:
-        return False, f"{target.host}:{target.ssh_port} — {exc.strerror or exc}"
+        return False, f"{target.host}:{target.ssh_port} - {exc.strerror or exc}"
     finally:
         sock.close()
         if on_progress:

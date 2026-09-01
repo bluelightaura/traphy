@@ -143,7 +143,7 @@ def wizard(session: Session) -> Profile | None:
 
 def _ask_layer() -> str | None:
     options = [(t(label), t(hint)) for _key, label, hint in _LAYERS]
-    title = f"{t('w_layer')}   —   {t('step', n=1, total=4)}"
+    title = f"{t('w_layer')}   -   {t('step', n=1, total=4)}"
     picked = ui.choose(title, options, cursor=2, keys_hint=t("keys_pick"),
                        width=ui.WIDE)
     return _LAYERS[picked][0] if picked is not None else None
@@ -162,7 +162,7 @@ def _default_for(stream: Stream, layer: str) -> None:
 
 def _ask_fields(stream: Stream, step: int) -> bool:
     """The frame's own fields, filtered to the layer that has them."""
-    title = f"{t('w_fields')}   —   {t('step', n=step, total=4)}"
+    title = f"{t('w_fields')}   -   {t('step', n=step, total=4)}"
     done = {"ok": False}
 
     def finish() -> str:
@@ -191,13 +191,13 @@ def _finish_if_valid(stream: Stream, done: dict[str, bool]) -> str:
 
 
 def _ask_ranges(stream: Stream, step: int) -> bool:
-    title = f"{t('w_ranges')}   —   {t('step', n=step, total=4)}"
+    title = f"{t('w_ranges')}   -   {t('step', n=step, total=4)}"
     ranges_screen(stream, title=title)
     return True
 
 
 def _ask_rate(stream: Stream, step: int) -> bool:
-    title = f"{t('w_rate')}   —   {t('step', n=step, total=4)}"
+    title = f"{t('w_rate')}   -   {t('step', n=step, total=4)}"
     done = {"ok": False}
     edit_form(title, rate_fields(stream), width=ui.WIDE,
               keys_hint="↑/↓ поле   ↵ править   n готово   q отмена",
@@ -317,7 +317,7 @@ def _size_note(p: Packet) -> str:
     """Warn when the requested size cannot hold the headers it was given."""
     floor = {"l2": 14, "l3": 34, "l4": 54}[p.layer] + (4 if p.has_vlan else 0)
     if p.frame_size < floor:
-        return (f"! {p.frame_size} B мало для этих заголовков — "
+        return (f"! {p.frame_size} B мало для этих заголовков - "
                 f"кадр выйдет {floor} B")
     return ""
 
@@ -392,9 +392,9 @@ def _rate_note(stream: Stream) -> str:
     """
     pps = stream.pps()
     if pps > 200_000:
-        return f"! ~{pps:,.0f} pps — Scapy столько не выдаст, возьми меньше"
+        return f"! ~{pps:,.0f} pps - Scapy столько не выдаст, возьми меньше"
     if pps > 50_000:
-        return f"~{pps:,.0f} pps — на грани того, что Scapy тянет"
+        return f"~{pps:,.0f} pps - на грани того, что Scapy тянет"
     return ""
 
 
@@ -456,7 +456,7 @@ def _add_range(stream: Stream) -> str:
     """Offer only the fields this frame actually has, then edit the new one."""
     available = _range_targets(stream)
     if not available:
-        return "! в этом кадре нечего перебирать — добавь IP или L4"
+        return "! в этом кадре нечего перебирать - добавь IP или L4"
     options = [(target.label, _range_hint(target)) for target in available]
     picked = ui.choose(t("w_ranges"), options, keys_hint=t("keys_pick"),
                        width=ui.WIDE)
@@ -546,7 +546,7 @@ def _edit_range(stream: Stream, vf: VMField) -> str:
         Field("step", "шаг", lambda: str(vf.step), set_step,
               visible=lambda: vf.op is not VMOp.RANDOM),
     ]
-    edit_form(f"Диапазон — {vf.target.label}", fields, width=ui.WIDE,
+    edit_form(f"Диапазон - {vf.target.label}", fields, width=ui.WIDE,
               keys_hint="↑/↓ поле   ↵ править   q готово",
               header=[ui.c("  " + _preview(stream), "dim")])
     return _range_note(vf) or "диапазон обновлён"
@@ -560,7 +560,7 @@ def _range_note(vf: VMField) -> str:
     if size == 0:
         return "! концы диапазона не разбираются или стоят задом наперёд"
     if vf.op is not VMOp.RANDOM and size > EXPAND_CAP:
-        return (f"! {size} значений — будет урезано до {EXPAND_CAP}; "
+        return (f"! {size} значений - будет урезано до {EXPAND_CAP}; "
                 f"возьми шаг больше или диапазон уже")
     return ""
 
@@ -672,7 +672,7 @@ def _delete_stream(profile: Profile, index: int) -> str:
 def stream_editor(stream: Stream) -> None:
     """One stream, all of it: fields, rate, and the ranges behind one key."""
     fields = packet_fields(stream) + rate_fields(stream)
-    edit_form(f"Поток — {stream.name}", fields, width=ui.WIDE,
+    edit_form(f"Поток - {stream.name}", fields, width=ui.WIDE,
               keys_hint="↑/↓ поле   ↵ править   r диапазоны   q назад",
               header=[ui.c("  " + _preview(stream), "dim")],
               extra_keys={"r": lambda: _open_ranges(stream)})

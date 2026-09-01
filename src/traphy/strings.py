@@ -38,8 +38,8 @@ def t(key: str, **fmt: object) -> str:
 
 S: dict[str, dict[str, str]] = {
     # ---- launcher chrome ---------------------------------------------- #
-    "tagline": {"ru": "собрать трафик руками — погнать его скриптом",
-                "en": "compose traffic by hand — send it as a script"},
+    "tagline": {"ru": "собрать трафик руками - погнать его скриптом",
+                "en": "compose traffic by hand - send it as a script"},
     "target": {"ru": "Цель: ", "en": "Target: "},
     "profile": {"ru": "Профиль: ", "en": "Profile: "},
     "no_target": {"ru": "цель не настроена", "en": "no target set"},
@@ -87,16 +87,16 @@ S: dict[str, dict[str, str]] = {
                      "en": "↑/↓ stream   ↵ edit   space on/off   d delete   q back"},
     "keys_scroll": {"ru": "↑/↓ строка   ←/→ страница   q назад",
                     "en": "↑/↓ line   ←/→ page   q back"},
-    "keys_any": {"ru": "любая клавиша — назад", "en": "any key — back"},
-    "keys_run": {"ru": "Ctrl-C — прервать прогон", "en": "Ctrl-C — stop the run"},
+    "keys_any": {"ru": "любая клавиша - назад", "en": "any key - back"},
+    "keys_run": {"ru": "Ctrl-C - прервать прогон", "en": "Ctrl-C - stop the run"},
 
     # ---- target form -------------------------------------------------- #
-    "form_title": {"ru": "Цель — куда ставить генератор",
-                   "en": "Target — where traffic comes from"},
+    "form_title": {"ru": "Цель - куда ставить генератор",
+                   "en": "Target - where traffic comes from"},
     "f_name": {"ru": "имя цели", "en": "target name"},
     "f_engine": {"ru": "чем гнать", "en": "engine"},
     "engine_pick": {"ru": "Движок", "en": "Engine"},
-    "engine_soon": {"ru": "выбран, но ещё не реализован — гнать нечем",
+    "engine_soon": {"ru": "выбран, но ещё не реализован - гнать нечем",
                     "en": "selected, but not implemented yet"},
     "f_use_ssh": {"ru": "через SSH", "en": "over SSH"},
     "f_host": {"ru": "адрес", "en": "host"},
@@ -112,8 +112,8 @@ S: dict[str, dict[str, str]] = {
     "yes": {"ru": "да", "en": "yes"},
     "no": {"ru": "нет", "en": "no"},
     "unset": {"ru": "не задан", "en": "unset"},
-    "rx_unset": {"ru": "не задан — потери мерить нечем",
-                 "en": "unset — loss cannot be measured"},
+    "rx_unset": {"ru": "не задан - потери мерить нечем",
+                 "en": "unset - loss cannot be measured"},
     "checking": {"ru": "проверяю связь с {host}…", "en": "checking {host}…"},
     "saved_target": {"ru": "цель сохранена", "en": "target saved"},
 
@@ -139,15 +139,15 @@ S: dict[str, dict[str, str]] = {
     "w_fields": {"ru": "Поля кадра", "en": "Frame fields"},
     "w_rate": {"ru": "Как быстро и как долго", "en": "How fast, how long"},
     "w_ranges": {"ru": "Что перебирать", "en": "What walks"},
-    "w_no_range": {"ru": "ничего — фиксированный кадр",
-                   "en": "nothing — a fixed frame"},
+    "w_no_range": {"ru": "ничего - фиксированный кадр",
+                   "en": "nothing - a fixed frame"},
     "w_done": {"ru": "профиль собран: {name}", "en": "profile ready: {name}"},
 
     # ---- fields ------------------------------------------------------- #
     "p_name": {"ru": "имя потока", "en": "stream name"},
     "p_eth_src": {"ru": "MAC источника", "en": "source MAC"},
     "p_eth_dst": {"ru": "MAC назначения", "en": "destination MAC"},
-    "p_vlan": {"ru": "VLAN (пусто — без тега)", "en": "VLAN (blank = untagged)"},
+    "p_vlan": {"ru": "VLAN (пусто - без тега)", "en": "VLAN (blank = untagged)"},
     "p_ip_src": {"ru": "IP источника", "en": "source IP"},
     "p_ip_dst": {"ru": "IP назначения", "en": "destination IP"},
     "p_ttl": {"ru": "TTL", "en": "TTL"},
@@ -170,25 +170,25 @@ S: dict[str, dict[str, str]] = {
     "u_pct": {"ru": "% от линии", "en": "% of line"},
 
     # ---- streams screen ----------------------------------------------- #
-    "streams_head": {"ru": "Потоки — «{name}»", "en": "Streams — “{name}”"},
+    "streams_head": {"ru": "Потоки - «{name}»", "en": "Streams - “{name}”"},
     "add_stream": {"ru": "+ добавить поток", "en": "+ add a stream"},
     "total_rate": {"ru": "всего {pps} pps, {frames} кадров",
                    "en": "{pps} pps total, {frames} frames"},
     "stream_off": {"ru": "выключен", "en": "off"},
     "confirm_delete": {"ru": "удалить поток «{name}»? (y/n)",
                        "en": "delete stream “{name}”? (y/n)"},
-    "last_stream": {"ru": "это последний поток — удалять нечего",
-                    "en": "that is the only stream — nothing to delete"},
+    "last_stream": {"ru": "это последний поток - удалять нечего",
+                    "en": "that is the only stream - nothing to delete"},
 
     # ---- script ------------------------------------------------------- #
-    "script_head": {"ru": "Скрипт — {name} ({lines} строк)",
-                    "en": "Script — {name} ({lines} lines)"},
+    "script_head": {"ru": "Скрипт - {name} ({lines} строк)",
+                    "en": "Script - {name} ({lines} lines)"},
     "script_saved": {"ru": "записано: {path}", "en": "written: {path}"},
-    "script_where": {"ru": "куда сохранить (Enter — {default}): ",
-                     "en": "where to save (Enter — {default}): "},
+    "script_where": {"ru": "куда сохранить (Enter - {default}): ",
+                     "en": "where to save (Enter - {default}): "},
 
     # ---- run ---------------------------------------------------------- #
-    "run_head": {"ru": "Прогон — {name} → {target}", "en": "Run — {name} → {target}"},
+    "run_head": {"ru": "Прогон - {name} → {target}", "en": "Run - {name} → {target}"},
     "run_building": {"ru": "собираю кадры на хосте…", "en": "building frames on the host…"},
     "run_sending": {"ru": "гоню трафик", "en": "sending"},
     "run_done": {"ru": "прогон закончен", "en": "run finished"},
@@ -201,8 +201,8 @@ S: dict[str, dict[str, str]] = {
     "l_elapsed": {"ru": "прошло", "en": "elapsed"},
     "l_unmeasured": {"ru": "не мерялось", "en": "unmeasured"},
     "run_archive": {"ru": "прогон записан: {path}", "en": "archived: {path}"},
-    "how_long": {"ru": "сколько секунд гнать (Enter — {default}): ",
-                 "en": "how many seconds (Enter — {default}): "},
+    "how_long": {"ru": "сколько секунд гнать (Enter - {default}): ",
+                 "en": "how many seconds (Enter - {default}): "},
 
     # ---- history ------------------------------------------------------ #
     "history_head": {"ru": "История прогонов", "en": "Run history"},
@@ -213,7 +213,7 @@ S: dict[str, dict[str, str]] = {
     "bad_input": {"ru": "не понял ввод: {what}", "en": "could not read that: {what}"},
     "no_scapy_note": {"ru": "Scapy нужен на цели, не здесь",
                       "en": "Scapy is needed on the target, not here"},
-    "not_a_tty": {"ru": "это не терминал — меню не открыть; "
+    "not_a_tty": {"ru": "это не терминал - меню не открыть; "
                         "смотри traphy --help",
-                  "en": "not a terminal — no menu here; see traphy --help"},
+                  "en": "not a terminal - no menu here; see traphy --help"},
 }

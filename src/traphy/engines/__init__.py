@@ -47,7 +47,7 @@ def options() -> list[tuple[str, str, str]]:
     """(key, title, hint) for the engine picker, ready-to-use engines first."""
     out = []
     for engine in REGISTRY.values():
-        hint = engine.hint if engine.ready else f"{engine.hint} — {engine.status}"
+        hint = engine.hint if engine.ready else f"{engine.hint} - {engine.status}"
         out.append((engine.key, engine.title, hint))
     return out
 

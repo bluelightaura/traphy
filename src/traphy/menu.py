@@ -139,7 +139,7 @@ def _activate(row: Row, session: Session) -> None:
         return
     reason = locked_reason(row, session)
     if reason:
-        ui.notice([ui.c(f"  {row.title()} — {reason}", "warn"), "",
+        ui.notice([ui.c(f"  {row.title()} - {reason}", "warn"), "",
                    ui.c("  " + t("keys_any"), "dim")], ui.WIDE)
         return
     if row.action:
