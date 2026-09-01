@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traphy"
+version = "0.1.0"
+description = "Compose L2-L4 traffic by hand in a terminal, generate a Scapy script, run it on a target and read the counters back"
+readme = "README.md"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["network", "traffic", "scapy", "generator", "switch", "testing", "tui"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Networking",
+  "Topic :: System :: Networking :: Monitoring",
+]
+# The menu, the model and the code generator are standard library only: the
+# tool has to open on a laptop that will never send a packet. Scapy is needed
+# on the target, not here, and SSH is needed only when the target is remote.
+dependencies = []
+
+[project.optional-dependencies]
+ssh = ["paramiko>=3.4,<5"]
+local = ["scapy>=2.5,<3"]
+dev = [
+  "paramiko>=3.4,<5",
+  "pytest>=8.0,<10",
+  "ruff>=0.16,<0.17",
+  "scapy>=2.5,<3",
+  "build>=1.2,<2",
+]
+
+[project.scripts]
+traphy = "traphy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
+ignore = [
+  # Assigning a lambda is exactly right for the form predicates: they read as
+  # named conditions next to the field they gate, not as functions.
+  "E731",
+  # The interface is Russian throughout. "Ambiguous unicode character" fires on
+  # every Cyrillic о and а in every string, which is all of them.
+  "RUF001", "RUF002", "RUF003",
+]

@@ -1,0 +1,19 @@
+.venv/
+.venv-*/
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+# Generated locally: composed profiles, emitted scripts, packet captures and
+# run archives. All of them name real interfaces and real addresses.
+profiles/
+scripts/
+runs/
+output/
+*.pcap
+*.log
