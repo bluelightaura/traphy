@@ -24,7 +24,9 @@ import errno
 import os
 import select
 import shlex
-import subprocess
+# Running a script on another machine is the whole feature; the shell-out is
+# the point, not an oversight.
+import subprocess  # nosec B404
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -85,6 +87,11 @@ class Transport:
 
 def _wrap(script: str, args: list[str], python: str, sudo: bool) -> str:
     """The shell one-liner that materialises the script, runs it, removes it.
+
+    Everything variable is quoted before it reaches a shell: the script travels
+    as base64, and the interpreter and every argument go through ``shlex.quote``.
+    That is what makes the ``sh -c`` and the paramiko ``exec_command`` below
+    safe to hand a constructed string.
 
     ``sudo -n`` rather than plain ``sudo``: a password prompt on a non-interactive
     SSH channel hangs forever with nothing on screen, so it is better to fail
@@ -163,7 +170,8 @@ class LocalTransport(Transport):
                    timeout: int = DEFAULT_TIMEOUT, sudo: bool = False) -> Completed:
         cmd = _wrap(script, args, self.python, sudo)
         try:
-            proc = subprocess.Popen(
+            # cmd comes from _wrap, which quotes everything variable.
+            proc = subprocess.Popen(  # nosec B603
                 ["/bin/sh", "-c", cmd], stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -188,7 +196,7 @@ class SshTransport(Transport):
     """The sending machine is somewhere else, reached with paramiko."""
 
     def __init__(self, host: str, user: str, port: int = 22,
-                 key_filename: str = "", password: str = "",
+                 key_filename: str = "", password: str = "",  # nosec B107
                  python: str = "python3", strict_host_key: bool = True):
         try:
             import paramiko
@@ -232,7 +240,11 @@ class SshTransport(Transport):
                    timeout: int = DEFAULT_TIMEOUT, sudo: bool = False) -> Completed:
         cmd = _wrap(script, args, self.python, sudo)
         try:
-            _stdin, stdout, stderr = self._client.exec_command(cmd, timeout=timeout)
+            # See _wrap: the script travels base64-encoded and every argument
+            # goes through shlex.quote, so there is nothing left unquoted for
+            # a shell to reinterpret.
+            _stdin, stdout, stderr = self._client.exec_command(  # nosec B601
+                cmd, timeout=timeout)
         except Exception as exc:
             raise TransportError(f"команда не запустилась на {self.host}: {exc}") from exc
 
@@ -268,7 +280,7 @@ def _ssh_hint(host: str, user: str, exc: Exception) -> str:
     return f"SSH к {host}: {text}"
 
 
-def open_transport(target, password: str = "") -> Transport:
+def open_transport(target, password: str = "") -> Transport:  # nosec B107
     """The right transport for a target. Raises :class:`TransportError`.
 
     ``target`` is a :class:`~traphy.target.Target`; it is taken structurally so

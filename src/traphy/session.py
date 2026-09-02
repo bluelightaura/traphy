@@ -134,11 +134,15 @@ class Session:
         if not self.host.ok:
             self.disconnect()
             return False, self.host.error
-        return True, self._reached()
+        return True, self._reached(self.host)
 
-    def _reached(self) -> str:
-        info = self.host
-        assert info is not None
+    def _reached(self, info: HostInfo) -> str:
+        """The "what answered" line, from a probe the caller already checked.
+
+        Takes the info rather than reading ``self.host`` so it cannot be called
+        with nothing to describe - an assertion here would vanish under `-O`
+        and leave an AttributeError in its place.
+        """
         bits = [info.hostname or self.target.host, f"python {info.python}"]
         bits.append(f"scapy {info.scapy_version}" if info.has_scapy else "без scapy")
         return " · ".join(bits)

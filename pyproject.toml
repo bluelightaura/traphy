@@ -34,11 +34,15 @@ dependencies = []
 ssh = ["paramiko>=3.4,<5"]
 local = ["scapy>=2.5,<3"]
 dev = [
+  "bandit>=1.9,<2",
+  "build>=1.2,<2",
   "paramiko>=3.4,<5",
+  "pip-audit>=2.10,<3",
   "pytest>=8.0,<10",
+  # Pinned to one minor: ruff picks its own default rule set and every minor
+  # widens it, which turns CI red on code that has not changed.
   "ruff>=0.16,<0.17",
   "scapy>=2.5,<3",
-  "build>=1.2,<2",
 ]
 
 [project.scripts]

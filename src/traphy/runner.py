@@ -132,7 +132,7 @@ def run_dir_root() -> Path:
 
 
 def execute(profile: Profile, target: Target, spec: RunSpec | None = None,
-            on_event: EventCB | None = None, password: str = "",
+            on_event: EventCB | None = None, password: str = "",  # nosec B107
             transport: Transport | None = None) -> RunResult:
     """Do the run. Raises :class:`TransportError` when the target is unreachable.
 

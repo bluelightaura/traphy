@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest
+
+      - name: Static security scan
+        run: bandit -q -r src
+
+      - name: Audit dependencies
+        if: matrix.python-version == '3.14'
+        run: pip-audit
+
+      - name: Build distributions
+        if: matrix.python-version == '3.14'
+        run: python -m build
+
+      - name: Verify wheel installation
+        # The menu, the model and the code generator must work with no extras
+        # at all - Scapy belongs on the target, not on the machine composing
+        # the traffic. Installing the bare wheel is what proves that.
+        if: matrix.python-version == '3.14'
+        run: |
+          python -m venv /tmp/traphy-wheel
+          /tmp/traphy-wheel/bin/pip install dist/*.whl
+          /tmp/traphy-wheel/bin/traphy --version
+          /tmp/traphy-wheel/bin/traphy gen l3_ip -o /tmp/gen.py
+          /tmp/traphy-wheel/bin/python -c "compile(open('/tmp/gen.py').read(), 'g', 'exec')"
