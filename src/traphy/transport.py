@@ -36,6 +36,14 @@ from pathlib import Path
 # from its own duration; the default only covers short probes.
 DEFAULT_TIMEOUT = 300
 
+# Algorithms refused on every SSH connection. ssh-rsa signs with SHA-1 and is
+# long deprecated, but paramiko still negotiates it unless told not to - both
+# as a host key and as a user signature.
+DISABLED_ALGORITHMS: dict[str, list[str]] = {
+    "keys": ["ssh-rsa"],
+    "pubkeys": ["ssh-rsa"],
+}
+
 LineCB = Callable[[str], None]
 
 
@@ -224,6 +232,11 @@ class SshTransport(Transport):
                 password=password or None,
                 key_filename=key_filename or None,
                 timeout=10, allow_agent=True, look_for_keys=True,
+                # Legacy ssh-rsa is SHA-1 signed and has been deprecated for
+                # years; paramiko still offers it for compatibility. Turning it
+                # off for both host keys and user keys is what lets this tool
+                # honestly say it is not exposed to PYSEC-2026-2858.
+                disabled_algorithms=DISABLED_ALGORITHMS,
             )
         except paramiko.AuthenticationException as exc:
             raise TransportError(

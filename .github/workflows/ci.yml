@@ -41,7 +41,12 @@ jobs:
 
       - name: Audit dependencies
         if: matrix.python-version == '3.14'
-        run: pip-audit
+        # PYSEC-2026-2858 is paramiko's legacy ssh-rsa support. TRaphy turns
+        # that algorithm off on every connection, for host keys and user keys
+        # alike - see DISABLED_ALGORITHMS in transport.py and the test that
+        # asserts it. The ignore is a statement about this code, not a way to
+        # make the audit quiet.
+        run: pip-audit --ignore-vuln PYSEC-2026-2858
 
       - name: Build distributions
         if: matrix.python-version == '3.14'
