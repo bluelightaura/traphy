@@ -20,9 +20,10 @@ class Refusing(Transport):
 
 
 def test_the_registry_offers_every_declared_engine():
-    assert set(engines.REGISTRY) == {"scapy", "trex", "jmeter"}
+    assert set(engines.REGISTRY) == {"scapy", "trex", "ixia", "jmeter"}
     assert engines.get("scapy").ready is True
-    assert engines.get("trex").ready is False
+    assert engines.get("trex").ready is True
+    assert engines.get("ixia").ready is True
     assert engines.get("jmeter").ready is False
 
 
@@ -33,9 +34,10 @@ def test_an_unknown_engine_falls_back_rather_than_breaking_the_menu():
 
 def test_the_picker_says_which_engines_are_not_ready():
     labels = {key: hint for key, _title, hint in engines.options()}
-    assert "не реализован" in labels["trex"]
     assert "не реализован" in labels["jmeter"]
     assert "не реализован" not in labels["scapy"]
+    assert "не реализован" not in labels["trex"]
+    assert "не реализован" not in labels["ixia"]
 
 
 def test_a_not_ready_engine_refuses_before_anything_is_generated():
@@ -46,10 +48,10 @@ def test_a_not_ready_engine_refuses_before_anything_is_generated():
 
 def test_a_run_on_a_not_ready_engine_stops_at_validation():
     result = execute(presets.build("l3_ip"),
-                     Target(engine="trex", tx_iface="ens1"),
+                     Target(engine="jmeter", tx_iface="ens1"),
                      RunSpec(archive=False), transport=Refusing())
     assert result.rc == 2
-    assert "TRex" in result.note
+    assert "JMeter" in result.note
 
 
 def test_the_scapy_engine_builds_the_arguments_a_run_needs():
@@ -71,6 +73,7 @@ def test_each_engine_reports_what_its_host_is_missing():
     assert any("Scapy" in b for b in bare.blockers("scapy"))
     assert any("java" in b for b in bare.blockers("jmeter"))
     assert any("TRex" in b for b in bare.blockers("trex"))
+    assert any("ixnetwork-restpy" in b for b in bare.blockers("ixia"))
 
 
 def test_a_ready_scapy_host_has_nothing_blocking_it():
@@ -79,8 +82,14 @@ def test_a_ready_scapy_host_has_nothing_blocking_it():
     assert ready.blockers("scapy") == []
 
 
-def test_declared_engines_still_name_their_artefact():
-    """The seam is real: each one already knows what file it will produce."""
-    assert engines.get("trex").file_suffix == ".py"
+def test_a_declared_engine_still_names_its_artefact():
+    """The seam is real: even the unfinished one knows what it will produce."""
     assert engines.get("jmeter").file_suffix == ".jmx"
     assert engines.get("jmeter").layers == "L7"
+
+
+def test_only_the_engines_that_think_in_nic_names_ask_for_one():
+    """TRex's NICs are gone from /sys/class/net - DPDK took them."""
+    assert engines.get("scapy").uses_ifaces is True
+    assert engines.get("trex").uses_ifaces is False
+    assert engines.get("ixia").uses_ifaces is False

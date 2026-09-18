@@ -1,60 +1,140 @@
-"""The TRex engine - declared, not yet implemented.
+"""The TRex engine: a DPDK generator driven over its own control port.
 
-Where it fits: Scapy paces through the kernel and gives out somewhere in the
-tens of thousands of frames a second. Above that a run tells you about the
-generator rather than about the device, which is exactly when a DPDK generator
-earns its complexity. TRex also measures loss properly - per-stream flow stats
-counted in hardware rather than a sniffer matching a marker - so a result from
-it can carry a number the Scapy path has to caveat.
+Two things make this worth the extra moving parts. Scapy paces through the
+kernel and gives out somewhere in the tens of thousands of frames a second;
+above that a run describes the generator rather than the device. And TRex
+counts loss in hardware - one counter per stream group on the receiving port -
+instead of matching a marker in a payload with a sniffer, so its number goes
+into a report without a caveat attached.
 
-What it will need, and why it is not a small change:
+What it costs, and none of it is hidden from the operator:
 
-* **A profile in TRex's own shape.** ``STLStream`` with a ``STLProfile``, rates
-  as ``STLTXCont``/``STLTXSingleBurst``/``STLTXMultiBurst``, and ranges as
-  field-engine variables (``STLVmFlowVar`` plus a write to a packet offset)
-  rather than expanded frames. The model in :mod:`traphy.models` already lines
-  up with this - the ranges are called VM fields for exactly that reason.
-* **TRex's own Scapy.** Field offsets the engine writes into are resolved
-  against the patched Scapy that ships inside a TRex release. Frames crafted
-  with a stand-alone Scapy can land those writes at the wrong offset, so the
-  artefact has to be built on the host, under TRex's interpreter.
-* **A daemon, not a command.** TRex runs as a server and is driven over its
-  sync port by ``STLClient``; a run means connect, acquire the ports, load the
-  profile, start, poll stats, stop. That is a different lifecycle from "run a
-  script and read its stdout", so the artefact is a control script that talks
-  to a server that must already be up.
-* **Ports, not interfaces.** TRex owns its NICs through DPDK and addresses them
-  by index. The target's interface names stop being the right identifier, which
-  is what :class:`~traphy.target.Nic` exists to bridge.
-
-Selecting it is allowed; every path that would touch the wire refuses with the
-reason rather than half-working.
+* **The release has to be on the target.** Frames are built by the Scapy that
+  ships inside it, because the field engine writes at offsets computed against
+  that Scapy. :mod:`traphy.codegen_stl` explains why that is not pedantry.
+* **The daemon has to be up.** TRex owns the NICs through DPDK long before we
+  connect; a run is a conversation with a server, not a program we start.
+* **Ports, not interfaces.** The NICs are gone from ``/sys/class/net`` - they
+  belong to DPDK now - and are addressed by index. That is why
+  :attr:`uses_ifaces` is False and the target form asks for port numbers here.
+* **No root.** The daemon was started with it; the client that drives it is an
+  ordinary process, and asking for sudo would be asking for a privilege this
+  work does not use.
 """
 
 from __future__ import annotations
 
-from traphy.engines.base import Declared
+from typing import TYPE_CHECKING, Any
+
+from traphy import codegen_stl
+from traphy.models import Profile
 from traphy.probe import HostInfo
+from traphy.runspec import RunSpec
+from traphy.target import Target
+
+if TYPE_CHECKING:  # pragma: no cover - imported for types only
+    from pathlib import Path
+
+# What each way of counting the receive side is worth, in one line. Every
+# result carries one of these; a loss figure whose provenance went unsaid is
+# the thing this whole tool is arranged to avoid.
+RX_SOURCES = {
+    "flow_stats": "приём посчитан flow stats - счётчиками в железе по группе "
+                  "потока; это число можно класть в отчёт как есть",
+    "mixed": "часть потоков ушла без аппаратного счёта - потери посчитаны "
+             "не по всему прогону",
+    "port_counter": "приём посчитан счётчиком порта - там лежат не только "
+                    "наши кадры",
+    "none": "приём не измерялся - порт приёма не задан",
+}
 
 
-class TrexEngine(Declared):
+class TrexEngine:
     key = "trex"
     title = "TRex"
-    hint = "DPDK, линейная скорость, честные потери"
+    hint = "DPDK, линейная скорость, потери по flow stats"
     layers = "L2-L4"
-    ready = False
-    status = "ещё не реализован"
+    ready = True
+    status = ""
     file_suffix = ".py"
+    uses_ifaces = False
+
+    def generate(self, profile: Profile, tag: str) -> str:
+        return codegen_stl.generate(profile, tag=tag)
+
+    def interpreter(self, target: Target) -> str:
+        """The target's own Python. The release's library is put on its path by
+        the script rather than by the environment, so an operator can keep one
+        interpreter and switch releases by changing a directory."""
+        return target.python
+
+    def args(self, target: Target, spec: RunSpec, archive: Path | None) -> list[str]:
+        args = [
+            "--trex-dir", target.trex_dir,
+            "--server", target.trex_server,
+            "--sync-port", str(target.trex_sync_port),
+            "--tx-port", str(target.trex_port_tx),
+            "--duration", f"{spec.duration:g}",
+        ]
+        if target.trex_port_rx >= 0:
+            args += ["--rx-port", str(target.trex_port_rx)]
+        if spec.pps:
+            # TRex scales a whole profile with one multiplier, and it takes the
+            # target rate directly - so an aggregate override stays aggregate
+            # instead of being divided between streams here and rounded twice.
+            args += ["--mult", f"{spec.pps:g}pps"]
+        if spec.count:
+            # Passed on rather than dropped: the script refuses it with the
+            # reason and the way to get what was actually wanted.
+            args += ["--count", str(spec.count)]
+        if spec.dry_run:
+            args.append("--dry-run")
+        if spec.save_pcap and archive is not None:
+            args += ["--pcap", str(archive / "streams.pcap")]
+        return args
+
+    def needs_root(self, spec: RunSpec) -> bool:
+        return False
 
     def blockers(self, host: HostInfo) -> list[str]:
-        """What a host would need before this engine could be wired in.
-
-        Reported even while the engine is a plan, so setting a target up for it
-        is useful work rather than guesswork.
-        """
-        out = [f"движок TRex {self.status}"]
+        out: list[str] = []
         if not host.has_trex:
-            out.append("на цели не видно каталога TRex (обычно /opt/trex)")
-        if not (host.is_root or host.can_sudo):
-            out.append("нет root и sudo без пароля - TRex без них не поднять")
+            out.append("на цели не видно каталога TRex - обычно /opt/trex")
+        elif not host.has_trex_stl:
+            out.append(f"в {host.trex_dir} нет automation/trex_control_plane - "
+                       f"это не распакованный релиз TRex")
+        if not host.trex_daemon:
+            out.append("демон TRex не отвечает - подними его на цели: "
+                       "cd /opt/trex && ./t-rex-64 -i")
         return out
+
+    def port_labels(self, target: Target) -> tuple[str, str]:
+        return (f"порт {target.trex_port_tx}",
+                f"порт {target.trex_port_rx}" if target.trex_port_rx >= 0
+                else "")
+
+    def target_problems(self, target: Target) -> list[str]:
+        out: list[str] = []
+        if not target.trex_dir.strip():
+            out.append("не задан каталог TRex на цели")
+        if not 1 <= target.trex_sync_port <= 65535:
+            out.append("порт управления TRex вне 1..65535")
+        if target.trex_port_tx < 0:
+            out.append("не выбран порт отправки TRex")
+        if target.trex_port_rx >= 0 and target.trex_port_rx == target.trex_port_tx:
+            out.append("порт приёма совпадает с портом отправки - "
+                       "счётчик поймает собственную отправку, а не то, "
+                       "что вернулось через коробку")
+        return out
+
+    def frame_count(self, profile: Profile) -> int:
+        return codegen_stl.frame_count(profile)
+
+    def describe_result(self, event: dict[str, Any]) -> str:
+        return RX_SOURCES.get(str(event.get("rx_source", "")), "")
+
+    def warnings(self, profile: Profile) -> list[str]:
+        """What this profile gives up on TRex, before it is sent rather than
+        after. Not part of the engine protocol - the builder screen asks for it
+        by name, because only this engine has anything to say here."""
+        return codegen_stl.warnings(profile)

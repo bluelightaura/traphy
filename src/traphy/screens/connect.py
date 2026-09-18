@@ -13,8 +13,10 @@ are picked from what is there rather than typed from memory.
 from __future__ import annotations
 
 import copy
+import os
 
 from traphy import engines, ui
+from traphy.engines import ixia
 from traphy.forms import Field, as_int, edit_form
 from traphy.probe import Iface
 from traphy.session import Session
@@ -52,9 +54,34 @@ def _summary(session: Session, draft: Target) -> str:
     """The line under the form title: where this goes and what answered."""
     if session.host and session.host.ok:
         info = session.host
-        return (f"{info.hostname} · {info.kernel} · python {info.python} · "
-                + (f"scapy {info.scapy_version}" if info.has_scapy else "без scapy"))
+        head = f"{info.hostname} · {info.kernel} · python {info.python}"
+        if engines.get(draft.engine).uses_ifaces:
+            return head + " · " + (f"scapy {info.scapy_version}"
+                                   if info.has_scapy else "без scapy")
+        if draft.engine == "ixia":
+            return head + " · " + _ixia_summary(info)
+        return head + " · " + _trex_summary(info)
     return draft.endpoint()
+
+
+def _ixia_summary(info) -> str:
+    """Only one thing has to be here; the chassis is checked by the run."""
+    if not info.has_ixnetwork:
+        return "нет ixnetwork-restpy"
+    version = f" {info.ixnetwork_version}" if info.ixnetwork_version else ""
+    return f"ixnetwork-restpy{version}"
+
+
+def _trex_summary(info) -> str:
+    """What the target has of TRex, in the order it has to be fixed."""
+    if not info.has_trex:
+        return "TRex не найден"
+    where = info.trex_dir or "TRex"
+    version = f" {info.trex_version}" if info.trex_version else ""
+    if not info.has_trex_stl:
+        return f"{where}{version} - без control plane"
+    return f"TRex{version} в {where} · " + ("демон отвечает" if info.trex_daemon
+                                            else "демон не поднят")
 
 
 def _fields(session: Session, d: Target) -> list[Field]:
@@ -104,7 +131,87 @@ def _fields(session: Session, d: Target) -> list[Field]:
     def rx_set(_v: str) -> str:
         return _pick_iface(session, d, "rx")
 
+    def trex_dir_set(v: str) -> str:
+        d.trex_dir = v.strip() or "/opt/trex"
+        return ""
+
+    def trex_server_set(v: str) -> str:
+        d.trex_server = v.strip() or "127.0.0.1"
+        return ""
+
+    def trex_sync_set(v: str) -> str:
+        n, err = as_int(v, 1, 65535, t("f_trex_sync"))
+        if err:
+            return err
+        d.trex_sync_port = n
+        return ""
+
+    def trex_tx_set(v: str) -> str:
+        n, err = as_int(v, 0, 63, t("f_trex_tx"))
+        if err:
+            return err
+        d.trex_port_tx = n
+        return ""
+
+    def trex_rx_set(v: str) -> str:
+        """-1 is a real answer here: "nobody is counting the receive side"."""
+        if v.strip() in ("-", "-1", "нет"):
+            d.trex_port_rx = -1
+            return "! приём не измеряется - потери считать будет нечем"
+        n, err = as_int(v, 0, 63, t("f_trex_rx"))
+        if err:
+            return err
+        d.trex_port_rx = n
+        if n == d.trex_port_tx:
+            return ("! тот же порт, что и отправка - счётчик поймает "
+                    "собственную отправку, а не то, что вернулось")
+        return ""
+
+    def ixia_api_set(v: str) -> str:
+        d.ixia_api_host = v.strip()
+        session.disconnect()
+        return ""
+
+    def ixia_api_port_set(v: str) -> str:
+        n, err = as_int(v, 1, 65535, t("f_ixia_api_port"))
+        if err:
+            return err
+        d.ixia_api_port = n
+        return ""
+
+    def ixia_user_set(v: str) -> str:
+        """Empty means a server that wants no login at all, which is the
+        ordinary Windows case - so clearing it has to be possible."""
+        d.ixia_api_user = "" if v.strip() in ("-", "нет") else v.strip()
+        if d.ixia_api_user and not os.environ.get(ixia.PASSWORD_ENV):
+            return f"! пароль возьмётся из {ixia.PASSWORD_ENV} - его там нет"
+        return ""
+
+    def ixia_chassis_set(v: str) -> str:
+        d.ixia_chassis = v.strip()
+        return ""
+
+    def ixia_port_set(which: str):
+        def setter(v: str) -> str:
+            if ixia.parse_port(v) is None:
+                return "! порт задаётся как карта/порт, например 1/2"
+            setattr(d, f"ixia_port_{which}", v.strip().replace(":", "/"))
+            if ixia.parse_port(d.ixia_port_tx) == ixia.parse_port(d.ixia_port_rx):
+                return "! тот же порт, что и вторая сторона - принимать некуда"
+            return ""
+        return setter
+
+    def ixia_force_toggle(_v: str) -> str:
+        d.ixia_force = not d.ixia_force
+        if d.ixia_force:
+            return ("! порт будет отобран у владельца - если на нём сейчас "
+                    "чей-то замер, он сломается и человек не узнает почему")
+        return ""
+
     remote = lambda: d.use_ssh
+    by_iface = lambda: engines.get(d.engine).uses_ifaces
+    by_trex = lambda: d.engine == "trex"
+    by_ixia = lambda: d.engine == "ixia"
 
     def engine_set(v: str) -> str:
         d.engine = v
@@ -134,13 +241,57 @@ def _fields(session: Session, d: Target) -> list[Field]:
         Field("python", t("f_python"), lambda: d.python,
               lambda v: (setattr(d, "python", v.strip() or "python3"), "")[1]),
         Field("sudo", t("f_sudo"), lambda: _yn(d.use_sudo), sudo_toggle,
-              kind="toggle", hint="сырой сокет без root не открыть"),
+              kind="toggle", visible=by_iface,
+              hint="сырой сокет без root не открыть"),
         Field("tx", t("f_tx"), lambda: _iface_label(session, d.tx_iface), tx_set,
-              hint="↵ - список интерфейсов с цели"),
+              visible=by_iface, hint="↵ - список интерфейсов с цели"),
         Field("rx", t("f_rx"),
               lambda: _iface_label(session, d.rx_iface) if d.rx_iface else t("rx_unset"),
-              rx_set,
+              rx_set, visible=by_iface,
               hint="без него счётчик потерь ничего не значит"),
+
+        # TRex owns its NICs through DPDK, so they are gone from
+        # /sys/class/net and there is no interface list to pick from - the
+        # port is an index and the release has to be named.
+        Field("trex_dir", t("f_trex_dir"), lambda: d.trex_dir, trex_dir_set,
+              visible=by_trex, hint="распакованный релиз, внутри automation/"),
+        Field("trex_server", t("f_trex_server"), lambda: d.trex_server,
+              trex_server_set, visible=by_trex,
+              hint="адрес с точки зрения самой цели - обычно тут же"),
+        Field("trex_sync", t("f_trex_sync"), lambda: str(d.trex_sync_port),
+              trex_sync_set, visible=by_trex),
+        Field("trex_tx", t("f_trex_tx"), lambda: str(d.trex_port_tx),
+              trex_tx_set, visible=by_trex, hint="индекс порта, не имя NIC"),
+        Field("trex_rx", t("f_trex_rx"),
+              lambda: (str(d.trex_port_rx) if d.trex_port_rx >= 0
+                       else t("trex_rx_unset")),
+              trex_rx_set, visible=by_trex,
+              hint="«-» чтобы не мерить приём вовсе"),
+
+        # Ixia is an address in a rack rather than a machine: an API server to
+        # configure through, a chassis the cards live in, and a card/port pair
+        # for each side. There is nothing here to log into.
+        Field("ixia_api", t("f_ixia_api"),
+              lambda: d.ixia_api_host or t("unset"), ixia_api_set,
+              visible=by_ixia, hint="Windows GUI или Linux API server"),
+        Field("ixia_api_port", t("f_ixia_api_port"),
+              lambda: str(d.ixia_api_port), ixia_api_port_set, visible=by_ixia,
+              hint="11009 у Windows, 443 у Linux"),
+        Field("ixia_user", t("f_ixia_user"),
+              lambda: d.ixia_api_user or "без авторизации", ixia_user_set,
+              visible=by_ixia,
+              hint=f"пароль не хранится - берётся из {ixia.PASSWORD_ENV}"),
+        Field("ixia_chassis", t("f_ixia_chassis"),
+              lambda: d.ixia_chassis or t("unset"), ixia_chassis_set,
+              visible=by_ixia),
+        Field("ixia_tx", t("f_ixia_tx"), lambda: d.ixia_port_tx,
+              ixia_port_set("tx"), visible=by_ixia),
+        Field("ixia_rx", t("f_ixia_rx"), lambda: d.ixia_port_rx,
+              ixia_port_set("rx"), visible=by_ixia,
+              hint="обязателен: без него traffic item не собрать"),
+        Field("ixia_force", t("f_ixia_force"), lambda: _yn(d.ixia_force),
+              ixia_force_toggle, kind="toggle", visible=by_ixia,
+              hint="шасси общее - по умолчанию чужой порт не трогаем"),
         Field("link", t("f_link"), lambda: str(d.link_mbit), link_set,
               kind="pick", options=rate_options(),
               hint="нужно только чтобы посчитать «% от линии»"),

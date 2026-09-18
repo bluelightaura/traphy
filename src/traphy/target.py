@@ -35,7 +35,7 @@ LINK_RATES = (100, 1000, 10000, 25000, 40000, 100000)
 class Nic:
     """One interface on the target, under the name the operator thinks in."""
 
-    name: str = "tx"          # a label: "tx", "to-SW101", whatever reads well
+    name: str = "tx"          # a label: "tx", "to-the-switch", whatever reads
     iface: str = "eth0"       # what the target's kernel calls it
     note: str = ""
 
@@ -80,6 +80,31 @@ class Target:
     rx_iface: str = ""             # where they are expected back; empty = no rx
     link_mbit: int = 1000          # only used to price a "% of line" rate
 
+    # TRex addresses its NICs by index, because DPDK has taken them out of
+    # /sys/class/net entirely - an interface name is not a thing that exists
+    # on that box any more. These are only read when the engine is TRex; a
+    # Scapy target carries them unused and unharmed.
+    trex_dir: str = "/opt/trex"    # the unpacked release on the target
+    trex_server: str = "127.0.0.1"  # the daemon, as seen from the target
+    trex_sync_port: int = 4501     # its control port
+    trex_port_tx: int = 0
+    trex_port_rx: int = -1         # -1 = not set, so loss is not measured
+
+    # Ixia is not a machine at all: the traffic comes out of a chassis in a
+    # rack, configured through an API server, and the client runs here. So a
+    # port is an address plus a card and a socket on it, written "карта/порт".
+    # No password lives here - see traphy.engines.ixia.PASSWORD_ENV.
+    ixia_api_host: str = ""        # IxNetwork API server
+    ixia_api_port: int = 11009     # 11009 on Windows, 443 on the Linux server
+    ixia_api_user: str = ""        # empty = a server that wants no login
+    ixia_chassis: str = ""
+    ixia_port_tx: str = "1/1"
+    ixia_port_rx: str = "1/2"
+    # Taking a port off whoever is holding it. Off by default and deliberately
+    # so: a chassis is shared, and the person mid-measurement on that port has
+    # no way of knowing it was us.
+    ixia_force: bool = False
+
     nics: list[Nic] = field(default_factory=list)
 
     # ---- helpers ---------------------------------------------------------- #
@@ -90,19 +115,38 @@ class Target:
 
     def endpoint(self) -> str:
         """A short "where am I sending from" for the menu's header line."""
+        where = self.tx_label() or "-"
         if self.is_local:
-            return f"локально · {self.tx_iface or '-'}"
+            return f"локально · {where}"
         user = f"{self.ssh_user}@" if self.ssh_user else ""
         port = f":{self.ssh_port}" if self.ssh_port != 22 else ""
-        return f"{user}{self.host}{port} · {self.tx_iface or '-'}"
+        return f"{user}{self.host}{port} · {where}"
+
+    def _uses_ifaces(self) -> bool:
+        from traphy import engines
+
+        return engines.get(self.engine).uses_ifaces
+
+    def _labels(self) -> tuple[str, str]:
+        from traphy import engines
+
+        return engines.get(self.engine).port_labels(self)
+
+    def tx_label(self) -> str:
+        """Where frames leave from, named the way this engine names ports."""
+        return self._labels()[0]
+
+    def rx_label(self) -> str:
+        """Where they are expected back, or empty when nobody is counting."""
+        return self._labels()[1]
 
     def measures_rx(self) -> bool:
         """Whether a run can report loss at all, or only what it sent.
 
-        Without a receive interface the script counts TX and nothing else, and
-        every downstream number has to say so rather than implying zero loss.
+        Without a receive port the run counts TX and nothing else, and every
+        downstream number has to say so rather than implying zero loss.
         """
-        return bool(self.rx_iface)
+        return bool(self.rx_label())
 
     # ---- serialization ---------------------------------------------------- #
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +171,18 @@ class Target:
             tx_iface=str(d.get("tx_iface", "eth0")),
             rx_iface=str(d.get("rx_iface", "")),
             link_mbit=int(d.get("link_mbit", 1000)),
+            trex_dir=str(d.get("trex_dir", "/opt/trex")),
+            trex_server=str(d.get("trex_server", "127.0.0.1")),
+            trex_sync_port=int(d.get("trex_sync_port", 4501)),
+            trex_port_tx=int(d.get("trex_port_tx", 0)),
+            trex_port_rx=int(d.get("trex_port_rx", -1)),
+            ixia_api_host=str(d.get("ixia_api_host", "")),
+            ixia_api_port=int(d.get("ixia_api_port", 11009)),
+            ixia_api_user=str(d.get("ixia_api_user", "")),
+            ixia_chassis=str(d.get("ixia_chassis", "")),
+            ixia_port_tx=str(d.get("ixia_port_tx", "1/1")),
+            ixia_port_rx=str(d.get("ixia_port_rx", "1/2")),
+            ixia_force=bool(d.get("ixia_force", False)),
             nics=[Nic.from_dict(n) for n in d.get("nics", [])],
         )
 
@@ -143,11 +199,6 @@ class Target:
             problems.append("SSH включён, но логин не задан")
         if not 1 <= self.ssh_port <= 65535:
             problems.append("порт SSH вне 1..65535")
-        if not self.tx_iface.strip():
-            problems.append("не выбран интерфейс отправки")
-        if self.rx_iface and self.rx_iface == self.tx_iface and not self.is_local:
-            problems.append("приём и отправка на одном интерфейсе - "
-                            "потери мерить нечем")
         if self.link_mbit <= 0:
             problems.append("скорость линии должна быть больше нуля")
         problems.extend(self._engine_problems())
@@ -156,17 +207,21 @@ class Target:
         return problems
 
     def _engine_problems(self) -> list[str]:
-        """Refuse a target pointed at an engine this build cannot drive.
+        """Refuse a target pointed at an engine this build cannot drive, and
+        otherwise ask that engine what it is missing.
 
-        Selecting one is fine while setting up; running is what needs it ready,
-        and this is the check every run goes through.
+        Selecting an unfinished engine is fine while setting up; running is
+        what needs it ready, and this is the check every run goes through.
+        What a ready engine needs from the target is its own business - an
+        interface name for Scapy, a port index for TRex - so it answers for
+        itself rather than being enumerated here.
         """
         from traphy import engines
 
         engine = engines.get(self.engine)
         if not engine.ready:
             return [f"движок «{engine.title}» {engine.status}"]
-        return []
+        return engine.target_problems(self)
 
 
 # --------------------------------------------------------------------------- #

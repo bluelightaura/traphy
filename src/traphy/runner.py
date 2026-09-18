@@ -4,11 +4,14 @@ This is the seam between the model and the wire. :func:`execute` takes a
 profile and a target, generates the script, hands it to a transport, parses the
 ``@traphy`` event lines the script prints, and returns a :class:`RunResult`.
 
-The result is deliberately honest about where its numbers came from. A run
-without a receive interface reports ``reliable=False`` and a ``rx_source`` of
-``none``, and every place that displays it has to say so: a zero in the loss
-column that actually means "nobody was counting" is the single most misleading
-thing a traffic tool can print.
+The result is deliberately honest about where its numbers came from. There are
+four ways the receive side can be counted and they are not worth the same:
+``flow_stats`` is a hardware counter per stream group and needs no caveat,
+``port_counter`` also sees traffic that is not ours, ``mixed`` covers only part
+of the run, and ``none`` means nobody was counting at all. The result carries
+which one it was, and every place that displays it has to say so: a zero in the
+loss column that actually means "nobody was counting" is the single most
+misleading thing a traffic tool can print.
 
 Runs are also archived. Each one writes its profile, the exact script, the
 event log and the result into a timestamped directory, so a number quoted in a
@@ -61,8 +64,10 @@ class RunResult:
     requested_pps: float = 0.0
     achieved_pps: float = 0.0
 
-    rx_source: str = "none"      # "marker" when a sniffer counted, else "none"
-    reliable: bool = False       # False => the loss column means nothing
+    # marker | flow_stats | traffic_item | port_counter | mixed | partial |
+    # none - see the module note
+    rx_source: str = "none"
+    reliable: bool = False       # False => the loss column needs its caveat
     rc: int = 0
     note: str = ""
     truncated: list[str] = field(default_factory=list)
@@ -105,18 +110,56 @@ class RunResult:
         """Everything about this result a reader should not have to infer."""
         out: list[str] = []
         if not self.reliable:
-            out.append("приём не измерялся - колонка потерь ничего не значит; "
-                       "задай интерфейс приёма в настройке цели")
+            out.append(self._rx_caveat())
         if self.rate_shortfall > 10:
-            out.append(f"выдано {self.achieved_pps:.0f} pps из "
-                       f"{self.requested_pps:.0f} запрошенных "
-                       f"(-{self.rate_shortfall:.0f}%) - Scapy упёрся, "
-                       f"устройство на этой скорости не проверено")
+            out.append(self._rate_caveat())
         out.extend(f"диапазон урезан - {t}" for t in self.truncated)
         if self.rc != 0:
             why = f": {self.note}" if self.note else ""
             out.append(f"скрипт завершился с кодом {self.rc}{why}")
         return out
+
+    def _rx_caveat(self) -> str:
+        """Why this run's loss figure cannot be read at face value.
+
+        Four different situations, and they call for four different next
+        moves - which is the whole reason the source is carried rather than
+        just a boolean.
+        """
+        if self.rx_source == "port_counter":
+            return ("приём считан счётчиком порта - туда легло всё, что в "
+                    "него прилетело, так что потери по нему приблизительны")
+        if self.rx_source == "mixed":
+            return ("часть потоков ушла без аппаратного счёта - потери "
+                    "посчитаны не по всему прогону")
+        if self.rx_source == "partial":
+            return ("счётчики пришли не по всем потокам - потери посчитаны "
+                    "не по всему прогону")
+        where = ("порт приёма" if self.engine in ("trex", "ixia")
+                 else "интерфейс приёма")
+        return (f"приём не измерялся - колонка потерь ничего не значит; "
+                f"задай {where} в настройке цели")
+
+    def _rate_caveat(self) -> str:
+        """The rate the run actually held, and what falling short of it means.
+
+        On Scapy it usually means the kernel path ran out of road; on TRex the
+        generator is not the suspect, so the sentence points elsewhere. Either
+        way the conclusion is the same and it is the one that matters: the
+        device was not tested at the rate that was asked for.
+        """
+        head = (f"выдано {self.achieved_pps:.0f} pps из "
+                f"{self.requested_pps:.0f} запрошенных "
+                f"(-{self.rate_shortfall:.0f}%)")
+        if self.engine == "trex":
+            why = ("TRex не вышел на заданную скорость - обычно это потолок "
+                   "порта или профиль, который его не набирает")
+        elif self.engine == "ixia":
+            why = ("шасси не вышло на заданную скорость - обычно это потолок "
+                   "порта или профиль, который его не набирает")
+        else:
+            why = "Scapy упёрся"
+        return f"{head} - {why}, устройство на этой скорости не проверено"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -148,7 +191,12 @@ def execute(profile: Profile, target: Target, spec: RunSpec | None = None,
     started = time.time()
     result = RunResult(
         profile=profile.name, target=target.name,
-        tx_iface=target.tx_iface, rx_iface=target.rx_iface,
+        engine=target.engine,
+        # Named the way the selected engine names a port: an interface for
+        # Scapy, a TRex port index for TRex. The field keeps its name because
+        # the history and the run screen read it, but its contents follow the
+        # engine rather than assuming everything has a NIC name.
+        tx_iface=target.tx_label(), rx_iface=target.rx_label(),
         requested_pps=spec.pps or profile.total_pps(target.link_mbit),
         started_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
     )

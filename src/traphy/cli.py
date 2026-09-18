@@ -16,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-from traphy import __version__, codegen, menu, presets
+from traphy import __version__, codegen, engines, menu, presets
 from traphy.models import Profile
 from traphy.probe import inspect
 from traphy.runner import RunSpec, execute, recent_runs
@@ -35,8 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="где лежат сохранённые профили (по умолчанию: profiles)")
     sub = ap.add_subparsers(dest="command")
 
-    gen = sub.add_parser("gen", help="сгенерировать Scapy-скрипт")
+    gen = sub.add_parser("gen", help="сгенерировать скрипт прогона")
     gen.add_argument("profile", help="имя пресета или путь к profile.json")
+    gen.add_argument("--engine", default=engines.DEFAULT,
+                     choices=sorted(engines.REGISTRY),
+                     help="чем гнать: это решает, какой артефакт собирается")
     gen.add_argument("-o", "--out", metavar="FILE",
                      help="куда записать (по умолчанию - в stdout)")
 
@@ -115,7 +118,14 @@ def cmd_gen(args: argparse.Namespace) -> int:
         for problem in problems:
             print(f"! {problem}", file=sys.stderr)
         return 2
-    text = codegen.generate(profile)
+    engine = engines.get(args.engine)
+    try:
+        text = engine.generate(profile, tag=codegen.DEFAULT_TAG)
+    except engines.EngineNotReady as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 2
+    for warning in getattr(engine, "warnings", lambda _p: [])(profile):
+        print(f"! {warning}", file=sys.stderr)
     if not args.out:
         sys.stdout.write(text)
         return 0
@@ -123,7 +133,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
-    print(f"записано: {path}  ({codegen.frame_count(profile)} кадров)")
+    print(f"записано: {path}  ({engine.frame_count(profile)} кадров)")
     return 0
 
 

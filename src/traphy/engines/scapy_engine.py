@@ -30,6 +30,7 @@ class ScapyEngine:
     ready = True
     status = ""
     file_suffix = ".py"
+    uses_ifaces = True
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen.generate(profile, tag=tag)
@@ -72,6 +73,26 @@ class ScapyEngine:
             out.append("нет root и sudo без пароля - сырой сокет не открыть")
         if not any(i.is_up for i in host.usable_ifaces()):
             out.append("ни один подходящий интерфейс не поднят")
+        return out
+
+    def port_labels(self, target: Target) -> tuple[str, str]:
+        return target.tx_iface, target.rx_iface
+
+    def target_problems(self, target: Target) -> list[str]:
+        """An interface name is this engine's whole idea of a port.
+
+        The receive check only fires on a remote target: sending and sniffing
+        on one interface is how a local loopback test is legitimately done,
+        whereas on a box across the room it means the sniffer is counting our
+        own departures and calling them arrivals.
+        """
+        out: list[str] = []
+        if not target.tx_iface.strip():
+            out.append("не выбран интерфейс отправки")
+        if target.rx_iface and target.rx_iface == target.tx_iface \
+                and not target.is_local:
+            out.append("приём и отправка на одном интерфейсе - "
+                       "потери мерить нечем")
         return out
 
     def frame_count(self, profile: Profile) -> int:

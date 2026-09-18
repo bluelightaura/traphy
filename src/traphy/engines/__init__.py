@@ -12,14 +12,15 @@ happened. So an engine is a small object - it declares what it needs from the
 host, turns a profile into an artefact, and says how to invoke it - and the
 rest of the tool does not branch on which one is selected.
 
-Only Scapy is implemented. The other two are declared here rather than left as
-an idea, so the seam they will fit into is a real one: selecting them tells the
+Scapy, TRex and Ixia are implemented. JMeter is declared here rather than left
+as an idea, so the seam it will fit into is a real one: selecting it tells the
 operator exactly what is missing instead of failing somewhere deeper.
 """
 
 from __future__ import annotations
 
 from traphy.engines.base import Engine, EngineNotReady
+from traphy.engines.ixia import IxiaEngine
 from traphy.engines.jmeter import JMeterEngine
 from traphy.engines.scapy_engine import ScapyEngine
 from traphy.engines.trex import TrexEngine
@@ -27,7 +28,7 @@ from traphy.engines.trex import TrexEngine
 # In the order the menu offers them: what works, then what is coming.
 REGISTRY: dict[str, Engine] = {
     engine.key: engine
-    for engine in (ScapyEngine(), TrexEngine(), JMeterEngine())
+    for engine in (ScapyEngine(), TrexEngine(), IxiaEngine(), JMeterEngine())
 }
 
 DEFAULT = ScapyEngine.key

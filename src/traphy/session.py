@@ -51,7 +51,8 @@ class Session:
         """(text, colour role) for the launcher's connection line."""
         if self.connected:
             host = self.host.hostname if self.host else ""
-            where = f"{host} · {self.target.tx_iface}" if host else self.target.tx_iface
+            port = self.target.tx_label()
+            where = f"{host} · {port}" if host else port
             return f"✓ {strings.t('reachable')}: {where}", "ok"
         if self.host and not self.host.ok:
             return f"✗ {strings.t('unreachable')}: {ui.trim(self.host.error, 44)}", "bad"

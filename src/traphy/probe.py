@@ -69,12 +69,25 @@ class HostInfo:
     can_sudo: bool = False
     ifaces: list[Iface] = field(default_factory=list)
 
-    # What the other engines would need. Collected on the same round trip so
-    # that setting a target up for TRex or JMeter is answerable now, even
-    # though neither engine is wired in yet.
+    # What the other engines need, collected on the same round trip so that
+    # setting a target up for TRex or JMeter is answerable without a second.
     has_java: bool = False
     has_jmeter: bool = False
-    has_trex: bool = False
+
+    # TRex is three separate questions, and collapsing them into one boolean
+    # is how "TRex is installed" ends up meaning "the run will work". The
+    # directory can be there without the control plane in it, and both can be
+    # there with the daemon down - three different things to go and fix.
+    has_trex: bool = False          # a release directory exists
+    trex_dir: str = ""              # where it is
+    trex_version: str = ""          # what it says it is, when it says
+    has_trex_stl: bool = False      # the control plane is inside it
+    trex_daemon: bool = False       # something answers on the control port
+
+    # Ixia needs nothing on the target beyond the client library, because the
+    # traffic is not produced there - it comes out of a chassis elsewhere.
+    has_ixnetwork: bool = False
+    ixnetwork_version: str = ""
 
     def usable_ifaces(self) -> list[Iface]:
         """Real NICs first; falls back to everything when there are none.
@@ -149,6 +162,13 @@ def scapy():
     except Exception:
         return False, ""
 
+def ixnetwork():
+    try:
+        import ixnetwork_restpy
+        return True, getattr(ixnetwork_restpy, "__version__", "?")
+    except Exception:
+        return False, ""
+
 def which(name):
     for base in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(base, name)
@@ -156,11 +176,59 @@ def which(name):
             return True
     return False
 
-def trex_dir():
-    for path in ("/opt/trex", "/usr/local/trex"):
-        if os.path.isdir(path):
-            return True
-    return False
+def trex_dirs():
+    """Plausible unpacked releases. A release is often /opt/trex/v3.04 rather
+    than /opt/trex itself, so the versioned subdirectories count too, newest
+    name first."""
+    out = []
+    for base in ("/opt/trex", "/usr/local/trex", "/opt/trex-core"):
+        if not os.path.isdir(base):
+            continue
+        out.append(base)
+        try:
+            for name in sorted(os.listdir(base), reverse=True):
+                path = os.path.join(base, name)
+                if os.path.isdir(path):
+                    out.append(path)
+        except OSError:
+            pass
+    return out
+
+def trex_facts():
+    found = ""
+    stl = False
+    for path in trex_dirs():
+        if not found:
+            found = path
+        if os.path.isdir(os.path.join(path, "automation", "trex_control_plane")):
+            found, stl = path, True
+            break
+    version = ""
+    if found:
+        version = read(os.path.join(found, "VERSION"))
+        if not version:
+            tail = os.path.basename(found)
+            version = tail if tail[:1] == "v" else ""
+    return {
+        "has_trex": bool(found),
+        "trex_dir": found,
+        "trex_version": version,
+        "has_trex_stl": stl,
+        "trex_daemon": answers(4501),
+    }
+
+def answers(port):
+    """Whether the daemon is listening - asked on the box itself, where the
+    control port is not exposed to anyone else."""
+    sock = socket.socket()
+    sock.settimeout(0.5)
+    try:
+        sock.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 def can_sudo():
     if os.geteuid() == 0:
@@ -173,7 +241,8 @@ def can_sudo():
         return False
 
 has, version = scapy()
-print("@traphy " + json.dumps({
+has_ixnet, ixnet_version = ixnetwork()
+info = {
     "ev": "host",
     "ok": True,
     "hostname": socket.gethostname(),
@@ -186,8 +255,11 @@ print("@traphy " + json.dumps({
     "ifaces": ifaces(),
     "has_java": which("java"),
     "has_jmeter": which("jmeter"),
-    "has_trex": trex_dir(),
-}))
+    "has_ixnetwork": has_ixnet,
+    "ixnetwork_version": ixnet_version,
+}
+info.update(trex_facts())
+print("@traphy " + json.dumps(info))
 '''
 
 
@@ -231,6 +303,12 @@ def inspect(transport: Transport, timeout: int = 30) -> HostInfo:
         has_java=bool(payload.get("has_java")),
         has_jmeter=bool(payload.get("has_jmeter")),
         has_trex=bool(payload.get("has_trex")),
+        trex_dir=str(payload.get("trex_dir", "")),
+        trex_version=str(payload.get("trex_version", "")),
+        has_trex_stl=bool(payload.get("has_trex_stl")),
+        trex_daemon=bool(payload.get("trex_daemon")),
+        has_ixnetwork=bool(payload.get("has_ixnetwork")),
+        ixnetwork_version=str(payload.get("ixnetwork_version", "")),
     )
 
 

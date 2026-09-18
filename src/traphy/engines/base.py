@@ -34,6 +34,7 @@ class Engine(Protocol):
     ready: bool         # False while an engine is declared but not implemented
     status: str         # why it is not ready, when it is not
     file_suffix: str    # what the generated artefact is called
+    uses_ifaces: bool   # whether a NIC name is how this engine names a port
 
     def generate(self, profile: Profile, tag: str) -> str:
         """The artefact to ship: a script, a plan, a config."""
@@ -49,6 +50,24 @@ class Engine(Protocol):
 
     def blockers(self, host: HostInfo) -> list[str]:
         """What about this host would stop the run, worded as something to fix."""
+
+    def port_labels(self, target: Target) -> tuple[str, str]:
+        """(where frames leave, where they are expected back) in this engine's
+        own vocabulary: an interface name, a port index, a chassis and slot.
+
+        The run result and every screen show these, and none of them should
+        have to know which engine is selected to print a sensible line.
+        """
+
+    def target_problems(self, target: Target) -> list[str]:
+        """What this engine needs from the target that it has not been given.
+
+        A Scapy target is wrong without an interface name; a TRex target is
+        wrong without a port index, and an interface name means nothing to it
+        at all. Rather than :meth:`Target.validate` growing a branch per
+        engine, each engine says what it needs and the target asks whichever
+        one it is pointed at.
+        """
 
     def frame_count(self, profile: Profile) -> int:
         """How many distinct units of work the artefact will build."""
@@ -72,6 +91,7 @@ class Declared:
     ready = False
     status = "ещё не реализован"
     file_suffix = ".txt"
+    uses_ifaces = True
 
     def _refuse(self) -> EngineNotReady:
         return EngineNotReady(
@@ -89,6 +109,14 @@ class Declared:
 
     def needs_root(self, spec):
         return False
+
+    def port_labels(self, target):
+        """Interface names, until an engine says otherwise."""
+        return target.tx_iface, target.rx_iface
+
+    def target_problems(self, target):
+        """Nothing to ask for yet - what it will need is not decided."""
+        return []
 
     def frame_count(self, profile):
         return 0

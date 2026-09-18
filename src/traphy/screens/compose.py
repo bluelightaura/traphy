@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import copy
 
-from traphy import presets, ui
+from traphy import engines, presets, ui
 from traphy.forms import (
     FORM_EXIT,
     Field,
@@ -25,7 +25,6 @@ from traphy.forms import (
     as_mac,
     edit_form,
 )
-from traphy.codegen import frame_count
 from traphy.models import (
     FieldTarget,
     L4Proto,
@@ -553,15 +552,22 @@ def _edit_range(stream: Stream, vf: VMField) -> str:
 
 
 def _range_note(vf: VMField) -> str:
-    """Flag a range that will be truncated before the run finds out for us."""
+    """Flag a range that will be truncated before the run finds out for us.
+
+    Which engine is selected decides whether it is truncated at all - Scapy
+    expands a range into frames and caps it, TRex hands it to the field engine
+    and walks all of it - and this form is deep enough inside the builder that
+    it has no target to ask. So it names both rather than warning about a limit
+    that may not apply or staying silent about one that does.
+    """
     from traphy.codegen import EXPAND_CAP
 
     size = range_size(vf)
     if size == 0:
         return "! концы диапазона не разбираются или стоят задом наперёд"
     if vf.op is not VMOp.RANDOM and size > EXPAND_CAP:
-        return (f"! {size} значений - будет урезано до {EXPAND_CAP}; "
-                f"возьми шаг больше или диапазон уже")
+        return (f"! {size} значений - на Scapy урежется до {EXPAND_CAP}, "
+                f"TRex обойдёт все; возьми шаг больше или диапазон уже")
     return ""
 
 
@@ -606,7 +612,10 @@ def streams_screen(session: Session) -> None:
 def _render_streams(session: Session, profile: Profile, cursor: int,
                     status: str) -> str:
     lines: list[str] = [ui.c(t("streams_head", name=profile.name), "title")]
-    frames = frame_count(profile)
+    # Asked of the engine, not of the Scapy generator: the same /16 sweep is
+    # 1024 frames there and 65 536 here, and the number on the screen has to
+    # be the one this target will actually build.
+    frames = engines.get(session.target.engine).frame_count(profile)
     pps = f"{profile.total_pps(session.target.link_mbit):,.0f}".replace(",", " ")
     lines.append(ui.c("  " + t("total_rate", pps=pps, frames=frames), "dim"))
     lines.append(None)  # type: ignore[arg-type]

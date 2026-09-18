@@ -33,6 +33,10 @@ dependencies = []
 [project.optional-dependencies]
 ssh = ["paramiko>=3.4,<5"]
 local = ["scapy>=2.5,<3"]
+# Only the Ixia engine needs a client library here: the chassis is configured
+# from this machine rather than from the target, which is what makes it the
+# one engine with a dependency on the side that opens the menu.
+ixia = ["ixnetwork-restpy>=1.1,<2"]
 dev = [
   "bandit>=1.9,<2",
   "build>=1.2,<2",
