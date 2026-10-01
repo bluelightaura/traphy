@@ -94,6 +94,7 @@ If you would rather build the environment yourself:
 python -m venv .venv && . .venv/bin/activate
 pip install -e .            # menu, model and generator - standard library only
 pip install -e '.[ssh]'     # + remote targets over SSH
+pip install -e '.[local]'   # + the target is this machine: Scapy is needed here then
 pip install -e '.[ixia]'    # + Ixia chassis: the IxNetwork client belongs here
 traphy                      # or: python -m traphy
 ```
@@ -102,6 +103,10 @@ traphy                      # or: python -m traphy
 does not need it at all: TRaphy builds and shows the script without it. The
 sending is done by the target, and that is where root or passwordless `sudo`
 are required.
+
+The exception is a local target, where "there" and "here" are the same machine:
+then Scapy does have to be installed next to the menu, which is what the
+`local` extra is for.
 
 ## From the command line
 
@@ -113,10 +118,19 @@ traphy gen ip_sweep -o sweep.py                 # build a script
 traphy gen ip_sweep --engine trex -o sweep.py   # the same, for TRex
 traphy gen ip_sweep --engine ixia -o sweep.py   # the same, for an Ixia chassis
 traphy probe -t bench                           # what is on the target: NIC, root, scapy
+traphy targets                                  # the saved targets
 traphy run ip_sweep -t bench -d 30              # run it
 traphy run l4_tcp -t bench --dry-run --json     # build the frames, send nothing
 traphy history -n 20
+traphy recover -t bench                         # clean up after a run that did not
 ```
+
+`recover` is there for one case: the run was killed by a signal or the SSH
+session dropped, its `finally` never executed, and the machine was left with
+ports held, service mode on and a live session. The next person sees a refusal
+that has nothing to do with their work. It is a separate command rather than a
+flag, because it is not a run at all - nothing is sent and the profile is not
+involved. An engine that cannot clean up says so instead of pretending.
 
 A saved script lives a life of its own:
 
