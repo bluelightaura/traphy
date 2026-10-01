@@ -31,6 +31,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from traphy import codegen_ixnet
+from traphy.engines import inventory
 from traphy.models import Profile
 from traphy.probe import HostInfo
 from traphy.runspec import RunSpec
@@ -164,3 +165,26 @@ class IxiaEngine:
 
     def warnings(self, profile: Profile) -> list[str]:
         return codegen_ixnet.warnings(profile)
+
+    def readiness(self, target: Target) -> inventory.Readiness:
+        """The chassis ports this target points at, before the session exists.
+
+        Two things will fill in here once a session is opened and neither can
+        be guessed from a file: whether the port has a link, and who is holding
+        it. The second is the one that matters - a chassis port is shared, and
+        a run that quietly takes one out from under a colleague mid-measurement
+        is worse than a run that refuses. Until the session lands, the holder
+        is reported as unknown rather than as free.
+        """
+        ports = [
+            inventory.Port(label=target.ixia_port_tx,
+                           description=target.ixia_chassis,
+                           note="отправка · карта/порт шасси"),
+            inventory.Port(label=target.ixia_port_rx,
+                           description=target.ixia_chassis,
+                           note="приём · карта/порт шасси"),
+        ]
+        where = target.ixia_api_host or "API-сервер не задан"
+        return inventory.not_asked(
+            ports, f"сессия к {where} не открывалась - занятость портов "
+                   f"и линк неизвестны, показана настройка цели")

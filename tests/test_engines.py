@@ -15,7 +15,8 @@ from traphy.transport import Transport
 class Refusing(Transport):
     """A transport that fails the test if anything is ever shipped through it."""
 
-    def run_stream(self, script, args, on_line, timeout=300, sudo=False):
+    def run_stream(self, script, args, on_line, timeout=300, sudo=False,
+                   secret=""):
         raise AssertionError("на неготовом движке ничего уезжать не должно")
 
 
@@ -93,3 +94,47 @@ def test_only_the_engines_that_think_in_nic_names_ask_for_one():
     assert engines.get("scapy").uses_ifaces is True
     assert engines.get("trex").uses_ifaces is False
     assert engines.get("ixia").uses_ifaces is False
+
+
+def test_scapy_capture_is_a_flag_not_a_path_on_this_machine():
+    """The script runs on the target; the archive is a directory here.
+
+    Handing it ``--pcap <local archive>/tx.pcap`` wrote the dump into a
+    directory the sending machine does not have, so nothing came back.
+    """
+    from pathlib import Path
+
+    from traphy.engines.scapy_engine import ScapyEngine
+    from traphy.runspec import RunSpec
+    from traphy.target import Target
+
+    target = Target(name="стенд", tx_iface="ens19", rx_iface="ens20")
+    args = ScapyEngine().args(target, RunSpec(capture=True, capture_limit=250),
+                              Path("/home/кто-то/.local/state/traphy/runs/x"))
+    assert "--capture" in args
+    assert args[args.index("--capture-limit") + 1] == "250"
+    assert not any("runs/x" in a for a in args)
+
+
+def test_a_dry_run_records_nothing():
+    from traphy.engines.scapy_engine import ScapyEngine
+    from traphy.runspec import RunSpec
+    from traphy.target import Target
+
+    args = ScapyEngine().args(Target(name="стенд", tx_iface="ens19"),
+                              RunSpec(capture=True, dry_run=True), None)
+    assert "--capture" not in args
+    assert "--dry-run" in args
+
+
+def test_both_engines_ship_frames_home_the_same_way():
+    """One piece of generated code, so a capture cannot work on one and not
+    the other - which is exactly what had happened."""
+    from traphy import codegen, codegen_stl, presets
+
+    profile = presets.build("l3_ip")
+    for module in (codegen, codegen_stl):
+        source = module.generate(profile, tag="TRAPHY0")
+        compile(source, module.__name__, "exec")
+        assert "def ship_pcap(" in source
+        assert source.count("CHUNK = 48000") == 1

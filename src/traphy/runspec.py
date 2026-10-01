@@ -21,3 +21,13 @@ class RunSpec:
     dry_run: bool = False        # build and report, send nothing
     save_pcap: bool = False
     archive: bool = True
+
+    # Recording is on by default, and that is the point of it. A capture that
+    # has to be asked for is a capture nobody has when the question arrives -
+    # and the question ("что именно прилетело?") always arrives after the run,
+    # never before it.
+    capture: bool = True
+    # Per side. TRex copies captured frames up to the control plane, so this
+    # cannot follow a line-rate run; the result says how much it kept rather
+    # than implying it kept everything.
+    capture_limit: int = 1000

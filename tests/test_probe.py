@@ -13,7 +13,8 @@ class Fixed(Transport):
     def __init__(self, payload=None, rc=0, stderr=""):
         self.payload, self.rc, self.stderr = payload, rc, stderr
 
-    def run_stream(self, script, args, on_line, timeout=300, sudo=False):
+    def run_stream(self, script, args, on_line, timeout=300, sudo=False,
+                   secret=""):
         line = ""
         if self.payload is not None:
             line = "@traphy " + json.dumps(self.payload)

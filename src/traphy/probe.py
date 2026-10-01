@@ -82,7 +82,21 @@ class HostInfo:
     trex_dir: str = ""              # where it is
     trex_version: str = ""          # what it says it is, when it says
     has_trex_stl: bool = False      # the control plane is inside it
-    trex_daemon: bool = False       # something answers on the control port
+    # Что-то слушает на порту управления. Ровно это и ничего больше: порт
+    # открыт. Говорить ли с демоном - отдельный вопрос, см. trex_rpc.
+    trex_daemon: bool = False
+    # Демон ответил на настоящий запрос. Без этого прогон не пойдёт, даже если
+    # порт открыт.
+    trex_rpc: bool = False
+    trex_rpc_error: str = ""
+    trex_rpc_ports: int = 0
+    # Сколько портов отдано демону, по его cfg. Номер порта у TRex - индекс в
+    # этом списке; карты забрал DPDK, и узнать это больше неоткуда.
+    trex_ports: int = 0
+    # Скорость линии по объявлению самого демона (port_bandwidth_gb). Ноль
+    # значит "не сказал" - и ноль лучше догадки: это число пересчитывает
+    # проценты линии в pps, и ошибка в нём тихо перекашивает весь замер.
+    trex_link_mbit: int = 0
 
     # Ixia needs nothing on the target beyond the client library, because the
     # traffic is not produced there - it comes out of a chassis elsewhere.
@@ -113,7 +127,7 @@ class HostInfo:
 # The probe itself. Kept as a string because it runs *there*, under whatever
 # Python the target has, and must not depend on anything TRaphy installed here.
 PROBE_SCRIPT = '''\
-import json, os, platform, socket, subprocess, sys
+import importlib, json, os, platform, socket, subprocess, sys
 
 def read(path, default=""):
     try:
@@ -177,11 +191,21 @@ def which(name):
     return False
 
 def trex_dirs():
-    """Plausible unpacked releases. A release is often /opt/trex/v3.04 rather
-    than /opt/trex itself, so the versioned subdirectories count too, newest
-    name first."""
+    """Plausible unpacked releases, the one the target named coming first.
+
+    Guessing at all is a fallback. The target already knows where TRex is -
+    the operator typed it in - and a probe that searches its own list instead
+    reports "no TRex here" about a machine whose daemon is answering, which is
+    both wrong and the kind of wrong that sends somebody to reinstall a
+    working release.
+
+    A release is often /opt/trex/v3.04 rather than /opt/trex itself, so the
+    versioned subdirectories count too, newest name first.
+    """
     out = []
-    for base in ("/opt/trex", "/usr/local/trex", "/opt/trex-core"):
+    told = sys.argv[1] if len(sys.argv) > 1 else ""
+    for base in ([told] if told else []) + ["/opt/trex", "/usr/local/trex",
+                                            "/opt/trex-core"]:
         if not os.path.isdir(base):
             continue
         out.append(base)
@@ -192,6 +216,22 @@ def trex_dirs():
                     out.append(path)
         except OSError:
             pass
+    # Релиз часто распакован просто в /opt/trex-3.08 - не в "trex" и не внутри
+    # него. Список известных имён такой машине говорит "здесь нет TRex" при
+    # живом демоне, поэтому один уровень под /opt осматривается целиком.
+    # Проверка дешёвая: интересует только каталог с control plane внутри.
+    for root in ("/opt", "/usr/local", "/srv"):
+        try:
+            names = sorted(os.listdir(root), reverse=True)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(root, name)
+            if path in out or not os.path.isdir(path):
+                continue
+            if os.path.isdir(os.path.join(path, "automation",
+                                          "trex_control_plane")):
+                out.append(path)
     return out
 
 def trex_facts():
@@ -209,13 +249,119 @@ def trex_facts():
         if not version:
             tail = os.path.basename(found)
             version = tail if tail[:1] == "v" else ""
-    return {
+    facts = {
         "has_trex": bool(found),
         "trex_dir": found,
         "trex_version": version,
         "has_trex_stl": stl,
         "trex_daemon": answers(4501),
     }
+    facts.update(trex_cfg_facts())
+    if stl:
+        facts.update(trex_rpc(found))
+    return facts
+
+def trex_rpc(trex_dir):
+    """Отвечает ли демон НА ЗАПРОСЫ, а не просто держит порт открытым.
+
+    Открытый TCP на 4501 доказывает ровно одно: там кто-то слушает. Этого
+    достаточно, чтобы написать «связь есть», и недостаточно, чтобы прогон
+    пошёл: демон, который ещё поднимается или завис, порт держит, а на запрос
+    отвечает отказом транспорта. Так один прогон и умер - «связь проверена», а
+    запустить нельзя.
+
+    Поэтому здороваемся по-настоящему: подключиться и спросить число портов.
+    Порты при этом не захватываются, чужой прогон не трогается.
+    """
+    for relative in ("automation/trex_control_plane/interactive",
+                     "automation/trex_control_plane/stl"):
+        path = os.path.join(trex_dir, relative)
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+    api = None
+    for name in ("trex.stl.api", "trex_stl_lib.api"):
+        try:
+            api = importlib.import_module(name)
+            break
+        except Exception:
+            continue
+    if api is None:
+        return {"trex_rpc": False, "trex_rpc_error": "библиотека не импортируется"}
+    client = None
+    try:
+        client = api.STLClient(server="127.0.0.1", sync_port=4501)
+        client.connect()
+        return {"trex_rpc": True, "trex_rpc_ports": int(client.get_port_count())}
+    except Exception as exc:
+        return {"trex_rpc": False, "trex_rpc_error": str(exc)[:200] or type(exc).__name__}
+    finally:
+        try:
+            if client is not None:
+                client.disconnect()
+        except Exception:
+            pass
+
+def trex_cfg_facts():
+    """Что демон знает о себе сам: сколько у него портов и какая линия.
+
+    Номер порта у TRex - это индекс в его списке интерфейсов, а не имя карты:
+    карты забрал DPDK и в /sys/class/net их нет. Скорость линии оттуда же -
+    гадать по названию модели бессмысленно, а ошибка в ней тихо перекашивает
+    пересчёт "процентов линии" в pps.
+
+    Разбор грубый и намеренно такой: тащить YAML-парсер на машину, где его
+    может не быть, ради двух чисел - плохая сделка. Берутся объявленные поля
+    port_limit и port_bandwidth_gb, а список interfaces считается только если
+    первого нет.
+    """
+    text = read("/etc/trex_cfg.yaml")
+    if not text:
+        return {"trex_ports": 0, "trex_link_mbit": 0}
+
+    ports = 0
+    mbit = 0
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("- ").strip()
+        if line.startswith("port_limit:"):
+            ports = to_int(line.split(":", 1)[1])
+        elif line.startswith("port_bandwidth_gb:"):
+            gb = to_int(line.split(":", 1)[1])
+            mbit = gb * 1000
+    if not ports:
+        ports = count_interfaces(text)
+    return {"trex_ports": ports, "trex_link_mbit": mbit}
+
+def count_interfaces(text):
+    """Длина списка interfaces, с оглядкой на отступ.
+
+    Без оглядки сюда попадают элементы соседних списков - у dual_if они тоже
+    начинаются с дефиса, и порт-лишний берётся ровно так.
+    """
+    count = 0
+    depth = None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if depth is None:
+            if stripped.startswith("interfaces"):
+                depth = indent
+            continue
+        if indent <= depth:
+            break
+        if stripped.startswith("-"):
+            count += 1
+    return count
+
+def to_int(text):
+    digits = ""
+    for ch in text.strip():
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    return int(digits) if digits else 0
 
 def answers(port):
     """Whether the daemon is listening - asked on the box itself, where the
@@ -231,14 +377,29 @@ def answers(port):
         sock.close()
 
 def can_sudo():
+    """Whether a run could elevate here - tested with what a run would run.
+
+    The obvious probe is `sudo -n true`, and it is wrong. The careful way to
+    grant this is a rule scoped to the interpreter:
+
+        someone ALL=(root) NOPASSWD: /usr/bin/python3
+
+    which permits exactly what a run needs and nothing else - and fails
+    `sudo -n true`. Reporting "нет sudo" there sends the operator to widen a
+    permission that was deliberately narrow, to fix a problem that does not
+    exist. So the interpreter is tried first, by name, the way the transport
+    invokes it; `true` remains as the second chance for a blanket rule.
+    """
     if os.geteuid() == 0:
         return True
-    try:
-        return subprocess.call(["sudo", "-n", "true"],
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL) == 0
-    except OSError:
-        return False
+    for probe in (["sudo", "-n", "python3", "-c", ""], ["sudo", "-n", "true"]):
+        try:
+            if subprocess.call(probe, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0:
+                return True
+        except OSError:
+            return False
+    return False
 
 has, version = scapy()
 has_ixnet, ixnet_version = ixnetwork()
@@ -263,8 +424,12 @@ print("@traphy " + json.dumps(info))
 '''
 
 
-def inspect(transport: Transport, timeout: int = 30) -> HostInfo:
+def inspect(transport: Transport, timeout: int = 30,
+            trex_dir: str = "") -> HostInfo:
     """Run the probe and turn its answer into a :class:`HostInfo`.
+
+    ``trex_dir`` is where the target says its TRex lives; it is searched before
+    the usual places, so a release unpacked somewhere unusual is still found.
 
     Never raises for an unhelpful target: a probe that fails comes back as an
     info object with ``ok`` False and a reason, because the setup screen wants
@@ -281,7 +446,8 @@ def inspect(transport: Transport, timeout: int = 30) -> HostInfo:
             payload = event
 
     try:
-        completed = transport.run_stream(PROBE_SCRIPT, [], take, timeout=timeout)
+        completed = transport.run_stream(
+            PROBE_SCRIPT, [trex_dir] if trex_dir else [], take, timeout=timeout)
     except TransportError as exc:
         return HostInfo(ok=False, error=str(exc))
 
@@ -307,6 +473,11 @@ def inspect(transport: Transport, timeout: int = 30) -> HostInfo:
         trex_version=str(payload.get("trex_version", "")),
         has_trex_stl=bool(payload.get("has_trex_stl")),
         trex_daemon=bool(payload.get("trex_daemon")),
+        trex_rpc=bool(payload.get("trex_rpc")),
+        trex_rpc_error=str(payload.get("trex_rpc_error", "")),
+        trex_rpc_ports=int(payload.get("trex_rpc_ports") or 0),
+        trex_ports=int(payload.get("trex_ports") or 0),
+        trex_link_mbit=int(payload.get("trex_link_mbit") or 0),
         has_ixnetwork=bool(payload.get("has_ixnetwork")),
         ixnetwork_version=str(payload.get("ixnetwork_version", "")),
     )

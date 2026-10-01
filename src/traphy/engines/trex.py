@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from traphy import codegen_stl
+from traphy.engines import inventory
 from traphy.models import Profile
 from traphy.probe import HostInfo
 from traphy.runspec import RunSpec
@@ -43,6 +44,9 @@ RX_SOURCES = {
                   "потока; это число можно класть в отчёт как есть",
     "mixed": "часть потоков ушла без аппаратного счёта - потери посчитаны "
              "не по всему прогону",
+    "flow_stats_blind": "аппаратные группы не сосчитали приём вообще, хотя "
+                        "порт кадры принял - цифра взята со счётчика порта. "
+                        "Проверять надо карту и драйвер, а не коробку",
     "port_counter": "приём посчитан счётчиком порта - там лежат не только "
                     "наши кадры",
     "none": "приём не измерялся - порт приёма не задан",
@@ -78,6 +82,11 @@ class TrexEngine:
         ]
         if target.trex_port_rx >= 0:
             args += ["--rx-port", str(target.trex_port_rx)]
+        if target.trex_force:
+            # Off unless the operator turned it on, and the script refuses a
+            # busy port without it. The generator is shared: evicting somebody
+            # mid-measurement has to be a decision, not a default.
+            args.append("--force")
         if spec.pps:
             # TRex scales a whole profile with one multiplier, and it takes the
             # target rate directly - so an aggregate override stays aggregate
@@ -89,8 +98,15 @@ class TrexEngine:
             args += ["--count", str(spec.count)]
         if spec.dry_run:
             args.append("--dry-run")
+        elif spec.capture and target.trex_port_rx >= 0:
+            # Only with a receive port: recording what left while nothing
+            # records what arrived answers half of every question.
+            args += ["--capture", "--capture-limit", str(spec.capture_limit)]
         if spec.save_pcap and archive is not None:
-            args += ["--pcap", str(archive / "streams.pcap")]
+            # НЕ путь: скрипт исполняется на машине-генераторе, а каталог
+            # прогона - на той, что его запустила. Переданный туда локальный
+            # путь роняет прогон в write_pcap ещё до подключения к демону.
+            args.append("--ship-frames")
         return args
 
     def needs_root(self, spec: RunSpec) -> bool:
@@ -103,9 +119,20 @@ class TrexEngine:
         elif not host.has_trex_stl:
             out.append(f"в {host.trex_dir} нет automation/trex_control_plane - "
                        f"это не распакованный релиз TRex")
+        where = host.trex_dir or "/opt/trex"
         if not host.trex_daemon:
-            out.append("демон TRex не отвечает - подними его на цели: "
-                       "cd /opt/trex && ./t-rex-64 -i")
+            # Каталог берётся из цели, а не из умолчания: совет "cd /opt/trex"
+            # на машине с релизом в /opt/trex-3.08 посылает искать не там.
+            out.append(f"демон TRex не отвечает - подними его на цели: "
+                       f"cd {where} && ./t-rex-64 -i")
+        elif host.has_trex_stl and not host.trex_rpc:
+            # Порт открыт, а говорить нельзя. Разница неочевидная и дорогая:
+            # «связь проверена» при этом зелёная, а прогон падает на первом же
+            # запросе к демону. Называем именно это, а не «нет TRex».
+            why = f" ({host.trex_rpc_error})" if host.trex_rpc_error else ""
+            out.append(f"порт 4501 открыт, но демон TRex не отвечает на "
+                       f"запросы{why} - обычно он ещё поднимается или завис; "
+                       f"перезапусти на цели: cd {where} && ./t-rex-64 -i")
         return out
 
     def port_labels(self, target: Target) -> tuple[str, str]:
@@ -138,3 +165,25 @@ class TrexEngine:
         after. Not part of the engine protocol - the builder screen asks for it
         by name, because only this engine has anything to say here."""
         return codegen_stl.warnings(profile)
+
+    def readiness(self, target: Target) -> inventory.Readiness:
+        """The ports this target is set up to use, before anything is asked.
+
+        TRex ports are indexes into the order in ``trex_cfg.yaml``, not the
+        numbers printed on the switch at the other end of the cable - a
+        mismatch that costs an afternoon the first time and is invisible in
+        every screen that does not say where the number came from. So it is
+        said here.
+
+        Querying the daemon itself lands with the live agent; until then this
+        reports configuration and is labelled as configuration.
+        """
+        ports = [inventory.Port(label=str(target.trex_port_tx),
+                                note="отправка · индекс DPDK из trex_cfg.yaml")]
+        if target.trex_port_rx >= 0:
+            ports.append(inventory.Port(
+                label=str(target.trex_port_rx),
+                note="приём · индекс DPDK из trex_cfg.yaml"))
+        return inventory.not_asked(
+            ports, f"демон на {target.trex_server}:{target.trex_sync_port} "
+                   f"не опрашивался - показаны порты из настройки цели")

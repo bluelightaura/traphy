@@ -100,8 +100,45 @@ class FakeClient:
     def connect(self):
         self.calls.append("connect")
 
-    def reset(self, ports=None):
-        self.calls.append(("reset", tuple(ports or ())))
+    # When set, acquire refuses the way a server refuses a port somebody else
+    # holds - with the owner in the message.
+    owner = ""
+
+    def acquire(self, ports=None, force=False):
+        if FakeClient.owner and not force:
+            raise RuntimeError(f"Port 0 is owned by '{FakeClient.owner}'")
+        self.calls.append(("acquire", tuple(ports or ()), force))
+
+    def release(self, ports=None):
+        self.calls.append(("release", tuple(ports or ())))
+
+    def remove_all_streams(self, ports=None):
+        self.calls.append(("remove_all_streams", tuple(ports or ())))
+
+    # ---------------------------------------------------- recording frames
+    # What the recording side does, which is where the ports get put into
+    # service mode - the mode that costs rate. A run leaving them in it makes
+    # every later run on this machine slow for reasons nobody connects to a
+    # capture taken hours earlier, so the tests watch it go off again.
+    capture_bytes = b"\xd4\xc3\xb2\xa1rest-of-a-pcap"
+    capture_fails = False
+    stop_fails = False
+
+    def set_service_mode(self, ports=None, enabled=False):
+        self.calls.append(("service_mode", tuple(ports or ()), enabled))
+
+    def start_capture(self, **spec):
+        if FakeClient.capture_fails:
+            raise RuntimeError("no room for another capture")
+        self.calls.append(("start_capture", tuple(sorted(spec))))
+        return {"id": len(self.calls)}
+
+    def stop_capture(self, handle, output=""):
+        self.calls.append(("stop_capture", handle))
+        if FakeClient.stop_fails:
+            raise RuntimeError("capture went away")
+        with open(output, "wb") as fh:
+            fh.write(FakeClient.capture_bytes)
 
     def add_streams(self, streams, ports=None):
         self.streams = list(streams)
@@ -111,7 +148,7 @@ class FakeClient:
         self.calls.append("clear_stats")
 
     def start(self, ports=None, duration=0, mult="1", force=False):
-        self.calls.append(("start", tuple(ports or ()), duration, mult))
+        self.calls.append(("start", tuple(ports or ()), duration, mult, force))
 
     def is_traffic_active(self, ports=None):
         self.polls += 1
@@ -126,20 +163,36 @@ class FakeClient:
     def disconnect(self):
         self.calls.append("disconnect")
 
+    # When set, what the hardware groups report on the receive side, apart
+    # from what the port counter saw. Real cards do disagree: some count
+    # transmission per group and never the reception.
+    group_rx = None
+    # Releases have keyed port counters both ways, and one release simply has
+    # no entry for a port it was not asked about.
+    str_keys = False
+    drop_rx_port = False
+
     def get_stats(self):
         groups = {}
         counted = [s for s in self.streams if s.flow_stats is not None]
+        seen = FakeClient.rx if FakeClient.group_rx is None else FakeClient.group_rx
         for s in counted:
             groups[s.flow_stats.kw["pg_id"]] = {
                 "tx_pkts": {"total": FakeClient.tx // len(counted)},
-                "rx_pkts": {"total": FakeClient.rx // len(counted)},
+                "rx_pkts": {"total": seen // len(counted)},
             }
-        return {
+        out = {
             0: {"opackets": FakeClient.tx, "obytes": FakeClient.tx * 64,
                 "tx_pps": 1000.0},
             1: {"ipackets": FakeClient.rx},
             "flow_stats": groups,
         }
+        if FakeClient.drop_rx_port:
+            del out[1]
+        if FakeClient.str_keys:
+            out = {(str(k) if isinstance(k, int) else k): v
+                   for k, v in out.items()}
+        return out
 
 
 @pytest.fixture
@@ -155,9 +208,22 @@ def fake_trex(monkeypatch):
     module.STLClient = FakeClient
     FakeClient.last = None
     FakeClient.tx, FakeClient.rx = 1000, 995
+    FakeClient.group_rx = None
+    FakeClient.owner = ""
+    FakeClient.str_keys = False
+    FakeClient.drop_rx_port = False
+    FakeClient.capture_fails = False
+    FakeClient.stop_fails = False
+    FakeClient.capture_bytes = b"\xd4\xc3\xb2\xa1rest-of-a-pcap"
     monkeypatch.setitem(sys.modules, "trex.stl.api", module)
     yield module
     FakeClient.last = None
+    FakeClient.group_rx = None
+    FakeClient.owner = ""
+    FakeClient.str_keys = False
+    FakeClient.drop_rx_port = False
+    FakeClient.capture_fails = False
+    FakeClient.stop_fails = False
 
 
 def run_stl(source: str, argv: list[str]) -> dict:
@@ -339,9 +405,82 @@ def test_the_receiving_port_is_acquired_too_or_its_counter_is_nobodys(fake_trex)
     run_stl(codegen_stl.generate(presets.build("l3_ip")),
             ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
              "--duration", "1"])
-    reset = next(c for c in FakeClient.last.calls
-                 if isinstance(c, tuple) and c[0] == "reset")
-    assert reset[1] == (0, 1)
+    got = next(c for c in FakeClient.last.calls
+               if isinstance(c, tuple) and c[0] == "acquire")
+    assert got[1] == (0, 1)
+
+
+def test_ports_are_asked_for_politely_rather_than_taken(fake_trex):
+    """``reset()`` is a force acquire. On a shared generator that is an
+    eviction, so the script asks without force unless told otherwise."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--duration", "1"])
+    calls = FakeClient.last.calls
+    assert ("acquire", (0,), False) in calls
+    assert not any(isinstance(c, tuple) and c[0] == "reset" for c in calls)
+    start = next(c for c in calls if isinstance(c, tuple) and c[0] == "start")
+    assert start[-1] is False          # force does not sneak in on start either
+
+
+def test_recording_forces_the_start_over_our_own_service_mode(fake_trex):
+    """Найдено на стенде 2026-09-30. Запись кадров ставит порты в сервисный
+    режим, а стартовать на таком порту TRex без force отказывается - то есть
+    неформированный старт ломал запись целиком.
+
+    Отъёма чужого тут нет: порты уже захвачены, и захват вежливый. Продавливаем
+    свой же режим.
+    """
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    start = next(c for c in FakeClient.last.calls
+                 if isinstance(c, tuple) and c[0] == "start")
+    assert start[-1] is True
+
+
+def test_without_recording_the_start_is_still_not_forced(fake_trex):
+    """Чтобы TRex по-прежнему отказывался стартовать на упавшем линке: честный
+    отказ лучше прогона, который вернётся как «потери 100%»."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    start = next(c for c in FakeClient.last.calls
+                 if isinstance(c, tuple) and c[0] == "start")
+    assert start[-1] is False
+
+
+def test_a_port_somebody_else_holds_stops_the_run_and_names_the_owner(
+        fake_trex, capsys):
+    """The promise the Ixia engine already makes, now kept here too: a busy
+    port is a reason to wait, not something to take while nobody is looking."""
+    FakeClient.owner = "коллега"
+    namespace = run_stl(codegen_stl.generate(presets.build("l3_ip")),
+                        ["--trex-dir", "/nowhere", "--tx-port", "0",
+                         "--duration", "1"])
+    assert namespace["_rc"] == 4
+    said = [e for e in events(capsys) if e["ev"] == "error"]
+    assert said and "коллега" in said[0]["msg"]
+    assert "--force" in said[0]["msg"]
+    assert not any(isinstance(c, tuple) and c[0] == "start"
+                   for c in FakeClient.last.calls)
+
+
+def test_force_takes_the_port_and_says_so(fake_trex):
+    FakeClient.owner = "коллега"
+    namespace = run_stl(codegen_stl.generate(presets.build("l3_ip")),
+                        ["--trex-dir", "/nowhere", "--tx-port", "0",
+                         "--duration", "1", "--force"])
+    assert namespace["_rc"] == 0
+    assert ("acquire", (0,), True) in FakeClient.last.calls
+
+
+def test_the_ports_are_handed_back_when_the_run_ends(fake_trex):
+    """A release that happens only as a side effect of disconnecting is one
+    that does not happen when the connection has already gone."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    calls = FakeClient.last.calls
+    assert ("release", (0, 1)) in calls
+    assert calls.index(("release", (0, 1))) < calls.index("disconnect")
 
 
 def test_without_a_receive_port_nothing_pretends_to_have_counted(
@@ -434,19 +573,32 @@ def test_driving_the_daemon_does_not_need_root():
     assert engine.needs_root(RunSpec(dry_run=True)) is False
 
 
-def test_the_three_ways_a_trex_host_can_be_unready_are_three_answers():
+def test_the_four_ways_a_trex_host_can_be_unready_are_four_answers():
+    """Схлопывать их в «нет TRex» значит посылать чинить не то. Четвёртый
+    появился после стенда: порт 4501 открыт, а демон на запросы не отвечает -
+    «связь проверена» при этом зелёная, и прогон падает на первом же запросе.
+    """
     engine = engines.get("trex")
     assert any("каталог" in b for b in engine.blockers(HostInfo(ok=True)))
 
     unpacked = HostInfo(ok=True, has_trex=True, trex_dir="/opt/trex")
     assert any("trex_control_plane" in b for b in engine.blockers(unpacked))
 
-    ready_but_down = HostInfo(ok=True, has_trex=True, has_trex_stl=True,
-                              trex_dir="/opt/trex")
-    assert any("демон" in b for b in engine.blockers(ready_but_down))
+    port_closed = HostInfo(ok=True, has_trex=True, has_trex_stl=True,
+                           trex_dir="/opt/trex")
+    said = engine.blockers(port_closed)
+    assert any("демон TRex не отвечает" in b for b in said)
+
+    deaf = HostInfo(ok=True, has_trex=True, has_trex_stl=True,
+                    trex_daemon=True, trex_rpc=False, trex_dir="/opt/trex-3.08",
+                    trex_rpc_error="Failed to send message to server")
+    said = engine.blockers(deaf)
+    assert any("не отвечает на запросы" in b for b in said)
+    assert any("Failed to send message" in b for b in said), "причина потеряна"
+    assert any("/opt/trex-3.08" in b for b in said), "совет указывает не на тот каталог"
 
     running = HostInfo(ok=True, has_trex=True, has_trex_stl=True,
-                       trex_daemon=True, trex_dir="/opt/trex")
+                       trex_daemon=True, trex_rpc=True, trex_dir="/opt/trex")
     assert running.blockers("trex") == []
 
 
@@ -575,3 +727,279 @@ def test_the_launcher_line_names_the_port_not_a_stale_interface():
     session.transport = Transport()
     text, role = session.status_line()
     assert "порт 2" in text and role == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# A zero from the hardware groups, contradicted by the port counter
+# --------------------------------------------------------------------------- #
+def test_groups_blind_to_the_receive_side_lose_to_the_port_counter(fake_trex,
+                                                                   capsys):
+    """Found on a live bench: the switch forwarded all 5000 frames, the port
+    counter saw all 5000, and the flow-stat groups reported nothing at all.
+    Trusting the group there turns a working link into "потери 100%" with
+    reliable=True on it - a confident wrong answer, and the worst kind."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 5000, 0
+    profile = presets.build("l3_ip")
+    run_stl(codegen_stl.generate(profile, tag="t"),
+            ["--trex-dir", "/nowhere", "--server", "127.0.0.1",
+             "--tx-port", "0", "--rx-port", "1", "--duration", "1"])
+    done = [e for e in events(capsys) if e.get("ev") == "done"][-1]
+    assert done["rx"] == 5000
+    assert done["rx_source"] == "flow_stats_blind"
+    assert done["reliable"] is False
+
+
+def test_a_genuine_zero_is_still_reported_as_a_hardware_zero(fake_trex, capsys):
+    """Nothing arrived and nothing was counted: the groups and the port agree,
+    so the zero stands as a hardware fact rather than being second-guessed."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 0, 0
+    profile = presets.build("l3_ip")
+    run_stl(codegen_stl.generate(profile, tag="t"),
+            ["--trex-dir", "/nowhere", "--server", "127.0.0.1",
+             "--tx-port", "0", "--rx-port", "1", "--duration", "1"])
+    done = [e for e in events(capsys) if e.get("ev") == "done"][-1]
+    assert done["rx"] == 0
+    assert done["rx_source"] == "flow_stats"
+    assert done["reliable"] is True
+
+
+def test_groups_that_counted_something_are_left_alone(fake_trex, capsys):
+    """A port counter is always >= the groups: it also sees traffic that is
+    not ours. Only a group total of zero is treated as a contradiction."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 9000, 4990
+    profile = presets.build("l3_ip")
+    run_stl(codegen_stl.generate(profile, tag="t"),
+            ["--trex-dir", "/nowhere", "--server", "127.0.0.1",
+             "--tx-port", "0", "--rx-port", "1", "--duration", "1"])
+    done = [e for e in events(capsys) if e.get("ev") == "done"][-1]
+    assert done["rx"] == 4990
+    assert done["rx_source"] == "flow_stats"
+    assert done["reliable"] is True
+
+
+def test_a_zero_nobody_could_contradict_is_not_sold_as_certain(
+        fake_trex, capsys):
+    """The safety net has its own failure mode. Groups reading zero is checked
+    against the receiving port - but if that counter cannot be read at all, the
+    check silently passes and a working link goes out as confident total loss.
+    """
+    FakeClient.group_rx = 0
+    FakeClient.drop_rx_port = True
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["rx_source"] == "flow_stats_unverified"
+    assert done["reliable"] is False
+    assert "сверить" in done["note"]
+
+
+def test_port_counters_are_found_whichever_way_the_release_keys_them(
+        fake_trex, capsys):
+    """Miss the port entry and the contradiction that saves a blind driver
+    never happens - so the lookup tries the string key too."""
+    FakeClient.group_rx = 0
+    FakeClient.str_keys = True
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["rx_source"] == "flow_stats_blind"
+    assert done["rx"] == 995
+
+
+# --------------------------------------------------------------------------- #
+# Recording frames: on by default, and until now exercised by nothing
+# --------------------------------------------------------------------------- #
+CAPTURE_ARGV = ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+                "--duration", "1", "--capture", "--capture-limit", "10"]
+
+
+def service_mode_calls(calls) -> list:
+    return [c for c in calls if isinstance(c, tuple) and c[0] == "service_mode"]
+
+
+def test_recording_puts_the_ports_in_service_mode_and_takes_them_out_again(
+        fake_trex):
+    """The mode is what makes recording possible and what costs the rate. Left
+    on, it slows every later run on this machine for reasons nobody will
+    connect to a capture taken hours earlier."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    modes = service_mode_calls(FakeClient.last.calls)
+    assert modes[0] == ("service_mode", (0, 1), True)
+    assert modes[-1] == ("service_mode", (0, 1), False)
+
+
+def test_the_rate_ceiling_is_said_out_loud_rather_than_discovered(
+        fake_trex, capsys):
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    said = " ".join(e.get("msg", "") for e in events(capsys)
+                    if e["ev"] == "note")
+    assert "сервисном режиме" in said
+    assert "потолок скорости" in said
+
+
+def test_recorded_frames_travel_home_inside_the_event_stream(
+        fake_trex, capsys):
+    """Nothing is left on the generator: it is shared, and a tool that
+    scatters pcaps across somebody else's box gets uninstalled."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    seen = events(capsys)
+    shipped = {e["name"] for e in seen if e["ev"] == "capture"}
+    assert shipped == {"tx", "rx"}
+    assert [e for e in seen if e["ev"] == "capture_data"]
+    for e in (e for e in seen if e["ev"] == "capture"):
+        assert e["bytes"] == len(FakeClient.capture_bytes)
+        assert e["limit"] == 10
+
+
+def test_the_sending_side_carries_its_checksum_caveat(fake_trex, capsys):
+    """TX frames are copied before the card computes checksums. Shipping that
+    without saying so means somebody opens the pcap and blames the device."""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    said = " ".join(e.get("msg", "") for e in events(capsys)
+                    if e["ev"] == "note")
+    assert "контрольные суммы" in said
+    assert "по записи приёма" in said
+
+
+def test_an_empty_capture_is_not_offered_as_proof_of_loss(fake_trex, capsys):
+    """Observed on real hardware: a non-zero receive counter and an empty L2
+    capture. Calling that "кадров не было" turns a property of the capture into
+    a finding about the link."""
+    FakeClient.capture_bytes = b""
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    said = " ".join(e.get("msg", "") for e in events(capsys)
+                    if e["ev"] == "note")
+    assert "НЕЛЬЗЯ судить о потерях" in said
+    assert "кадров не было" not in said
+
+
+def test_a_capture_that_will_not_start_does_not_take_the_run_with_it(
+        fake_trex, capsys):
+    """Recording is worth having, not worth failing a measurement over - but
+    the ports still have to come out of service mode."""
+    FakeClient.capture_fails = True
+    namespace = run_stl(codegen_stl.generate(presets.build("l3_ip")),
+                        CAPTURE_ARGV)
+    assert namespace["_rc"] == 0
+    said = " ".join(e.get("msg", "") for e in events(capsys)
+                    if e["ev"] == "note")
+    assert "захват не начался" in said
+    assert ("service_mode", (0, 1), False) in FakeClient.last.calls
+
+
+def test_a_capture_that_dies_on_the_way_out_still_frees_the_ports(
+        fake_trex, capsys):
+    FakeClient.stop_fails = True
+    run_stl(codegen_stl.generate(presets.build("l3_ip")), CAPTURE_ARGV)
+    assert service_mode_calls(FakeClient.last.calls)[-1][2] is False
+    said = " ".join(e.get("msg", "") for e in events(capsys)
+                    if e["ev"] == "note")
+    assert "не сохранилась" in said
+
+
+def test_without_a_receive_port_the_engine_does_not_ask_for_recording():
+    """Recording what left while nothing records what arrived answers half of
+    every question, so the engine does not turn it on at all."""
+    target = Target(name="t", engine="trex", trex_port_tx=0, trex_port_rx=-1)
+    args = engines.get("trex").args(target, RunSpec(capture=True), None)
+    assert "--capture" not in args
+
+
+def test_the_engine_never_hands_the_target_a_path_from_this_machine():
+    """Найдено на стенде 2026-09-30. Скрипт исполняется на машине-генераторе,
+    а каталог прогона живёт на той, что его запустила. Переданный туда путь
+    «~/.local/state/traphy/runs/…/streams.pcap» роняет прогон в write_pcap -
+    до подключения к демону, то есть до единого кадра в кабеле."""
+    from pathlib import Path
+
+    archive = Path("/home/кто-то/.local/state/traphy/runs/20260930-144830_x")
+    args = engines.get("trex").args(
+        Target(name="t", engine="trex", trex_port_tx=0, trex_port_rx=1),
+        RunSpec(save_pcap=True, dry_run=True), archive)
+    assert "--ship-frames" in args
+    assert not any(str(archive) in a for a in args), "путь отсюда уехал на цель"
+
+
+def test_shipped_sample_frames_come_home_inside_the_event_stream(
+        fake_trex, capsys):
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--duration", "1",
+             "--dry-run", "--ship-frames"])
+    seen = events(capsys)
+    shipped = [e for e in seen if e["ev"] == "capture" and e["name"] == "streams"]
+    assert shipped, "образцы кадров не поехали домой"
+    assert shipped[0]["bytes"] > 0
+    assert [e for e in seen if e["ev"] == "capture_data"]
+
+
+def test_shipping_frames_leaves_nothing_on_the_generator(fake_trex, capsys,
+                                                         tmp_path):
+    """Генератор общий: инструмент, раскидывающий по нему файлы, перестают
+    ставить."""
+    before = set(tmp_path.iterdir())
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--duration", "1",
+             "--dry-run", "--ship-frames"])
+    assert set(tmp_path.iterdir()) == before
+
+
+def test_a_hardware_count_bigger_than_what_was_sent_is_not_trusted(
+        fake_trex, capsys):
+    """Найдено на стенде 2026-09-30: в приёмный порт лился чужой трафик, группа
+    насчитала 46 млн при 20 тысячах отправленных - и прогон уходил с пометкой
+    «надёжно». Столько наших кадров вернуться не могло; это опровержение, а не
+    хороший результат."""
+    FakeClient.tx, FakeClient.rx = 20_000, 46_000_000
+    FakeClient.group_rx = 46_000_000
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["rx_source"] == "flow_stats"
+    assert done["reliable"] is False, "опровергнутый счёт нельзя звать надёжным"
+    assert "не только наше" in done["note"]
+
+
+def test_a_hardware_count_within_what_was_sent_is_still_trusted(
+        fake_trex, capsys):
+    FakeClient.tx, FakeClient.rx = 1000, 995
+    FakeClient.group_rx = 995
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["reliable"] is True
+
+
+def test_a_run_that_dies_still_puts_the_ports_back_in_the_fast_path(fake_trex):
+    """Найдено на стенде 2026-09-30, и это отравляло машину всем.
+
+    Сервисный режим включается ради записи кадров. Снимался он в stop_capture,
+    до которого при отказе посреди прогона дело не доходило - и порты
+    оставались в нём навсегда. Следующий прогон БЕЗ записи после этого не
+    стартует вообще: TRex отказывается пускать трафик на порт в сервисном
+    режиме. Связать это с записью, снятой часами раньше, не сможет никто.
+    """
+    class Boom(FakeClient):
+        def start(self, ports=None, duration=0, mult="1", force=False):
+            super().start(ports=ports, duration=duration, mult=mult, force=force)
+            raise RuntimeError("порт не пустил")
+
+    fake_trex.STLClient = Boom
+    namespace = run_stl(codegen_stl.generate(presets.build("l3_ip")),
+                        CAPTURE_ARGV)
+    assert namespace["_rc"] == 1
+    calls = FakeClient.last.calls
+    modes = service_mode_calls(calls)
+    assert modes, "сервисный режим вообще не трогали"
+    assert modes[-1][2] is False, "порты остались в сервисном режиме"
+    # И запись снята ДО него: пока она жива, TRex режим выключать отказывается.
+    stopped = [i for i, c in enumerate(calls)
+               if isinstance(c, tuple) and c[0] == "stop_capture"]
+    assert stopped, "запись осталась висеть на машине"
+    assert max(stopped) < calls.index(modes[-1])
+    # И отданы обратно, чтобы следующий не упёрся в мёртвого владельца.
+    assert any(isinstance(c, tuple) and c[0] == "release"
+               for c in FakeClient.last.calls)

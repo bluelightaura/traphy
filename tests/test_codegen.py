@@ -109,3 +109,40 @@ def test_the_marker_is_per_run():
 
 def test_script_name_is_derived_safely():
     assert script_name(Profile(name="l3 ip/sweep")) == "l3_ip_sweep.py"
+
+
+def _pacer_class(profile_name):
+    """Класс Pacer из сгенерированного скрипта - он живёт только там."""
+    from traphy import codegen, presets
+
+    namespace: dict = {}
+    exec(compile(codegen.generate(presets.build(profile_name)),  # nosec B102
+                 "<сгенерировано>", "exec"), namespace)
+    return namespace["Pacer"]
+
+
+def test_a_burst_stream_finishes_when_its_share_of_count_runs_out():
+    """Найдено на стенде: burst_probe не завершался никогда.
+
+    Бёрст в 2000 кадров при доле 500 отдаёт всё за один вызов и назначает
+    следующий бёрст на будущее. finished() смотрел только на бёрсты, а
+    --count вдобавок снимает дедлайн - и цикл крутился вечно.
+    """
+    pacer = _pacer_class("burst_probe")({"name": "burst", "pps": 500.0,
+                                         "mode": "multi_burst", "burst": 2000,
+                                         "bursts": 10, "ibg": 50000.0}, 500)
+    assert not pacer.finished()
+    pacer.sent += pacer.due(0.0)
+    assert pacer.sent == 500
+    assert pacer.finished(), "бёрстовый поток не увидел свой --count"
+    assert pacer.due(100.0) == 0
+
+
+def test_a_burst_stream_without_a_count_still_finishes_on_its_bursts():
+    """Вторая дорога к концу не должна была пострадать от починки первой."""
+    pacer = _pacer_class("burst_probe")({"name": "burst", "pps": 1000.0,
+                                         "mode": "single_burst", "burst": 10,
+                                         "bursts": 1, "ibg": 0.0}, 0)
+    pacer.sent += pacer.due(0.0)
+    assert pacer.sent == 10
+    assert pacer.finished()

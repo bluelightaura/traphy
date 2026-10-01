@@ -48,13 +48,13 @@ class ScapyEngine:
             args += ["--pps", f"{spec.pps:g}"]
         if spec.dry_run:
             args.append("--dry-run")
-        if spec.save_pcap and archive is not None:
-            # The dump lands on the sending machine. For a remote target it
-            # stays there, which the run screen says rather than implying the
-            # file appeared locally.
-            args += ["--pcap", str(archive / "tx.pcap")]
-            if target.rx_iface:
-                args += ["--rx-pcap", str(archive / "rx.pcap")]
+        elif spec.capture:
+            # Deliberately not a path. The script runs on the sending machine,
+            # and the archive is a directory on this one - handing it that path
+            # wrote the dump into a directory the target does not have. The
+            # frames come home inside the event stream instead, the same way
+            # TRex returns them, and land in the archive here.
+            args += ["--capture", "--capture-limit", str(spec.capture_limit)]
         return args
 
     def needs_root(self, spec: RunSpec) -> bool:

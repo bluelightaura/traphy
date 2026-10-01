@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ipaddress
 
+from traphy import codegen_ship
 from traphy.models import (
     FieldTarget,
     L4Proto,
@@ -64,7 +65,7 @@ def generate(profile: Profile, tag: str = "") -> str:
     skipped = [s.name for s in profile.streams if not s.enabled]
 
     parts = [_header(profile, skipped, tag, enabled), _HELPERS,
-             _builder(enabled), _ENGINE]
+             codegen_ship.SHIP, _builder(enabled), _ENGINE]
     return "\n\n".join(parts) + "\n"
 
 
@@ -150,11 +151,15 @@ def _header(profile: Profile, skipped: list[str], tag: str,
 # отчёте написано именно это, а не ноль.
 # ---------------------------------------------------------------------------
 import argparse
+import base64
 import importlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
+import traceback
 
 STL_PATHS = ({paths},)
 
@@ -252,6 +257,22 @@ def flow_stats(api, pg_id):
     if pg_id is None:
         return None
     return api.STLFlowStats(pg_id=pg_id)
+
+
+def port_stats(stats, port):
+    """One port's counters, whichever way this release keys them.
+
+    Worth a function because of what depends on it: the port counter is the
+    only thing that can contradict a zero from the flow-stat groups. Miss the
+    entry and the contradiction never happens - the safety net fails silently
+    and a working link is reported as total loss with confidence on it.
+    """
+    if port < 0:
+        return None
+    entry = stats.get(port)
+    if entry is None:
+        entry = stats.get(str(port))
+    return entry
 
 
 def total(value):
@@ -461,14 +482,52 @@ SOURCE_NOTES = {
              "не по всему прогону",
     "port_counter": "приём считан счётчиком порта: туда легло всё, что в него "
                     "прилетело, а не только наши кадры",
+    "flow_stats_blind": "группы потока на приёме не сосчитали НИЧЕГО, а порт "
+                        "принял кадры - цифра взята со счётчика порта. "
+                        "Так ведёт себя часть карт и драйверов: отправка "
+                        "считается, приём нет",
+    "flow_stats_unverified": "группы потока на приёме показали ноль, а "
+                             "счётчик порта приёма не прочитался - сверить "
+                             "было нечем, поэтому ноль подаётся как неточный",
     "none": "приём не измерялся - без --rx-port считать нечем",
 }
+
+
+class Busy(Exception):
+    """The ports belong to somebody else and we were not told to take them."""
+
+
+def take_ports(client, args, ports, quiet):
+    """Take the ports, or say who has them instead of taking them anyway.
+
+    ``reset()`` is what the examples reach for and it would be one line - but
+    it is documented as a FORCE acquire. On a generator shared with other
+    people that stops a colleague mid-measurement, and they learn about it
+    from their own numbers rather than from us. So ownership is asked for
+    politely here, and --force is the operator saying out loud that the port
+    is to be taken regardless.
+
+    What follows the acquire is the rest of what ``reset()`` does - our own
+    leftovers cleared and the counters zeroed - with nobody else's run touched.
+    """
+    try:
+        client.acquire(ports=ports, force=args.force)
+    except Exception as exc:
+        raise Busy("порты %s не отдаются: %s. Генератор общий - выясни, чей "
+                   "прогон идёт, либо задай --force, чтобы отобрать"
+                   % (", ".join(str(p) for p in ports), exc))
+    if args.force and client.is_traffic_active(ports=ports):
+        emit(quiet, ev="note",
+             msg="порты отобраны с --force, и на них шёл трафик - он остановлен")
+        client.stop(ports=ports)
+    client.remove_all_streams(ports=ports)
+    client.clear_stats()
 
 
 def sample(client, args, pg_ids, counted_all):
     """One reading of the counters, and where each number came from."""
     stats = client.get_stats()
-    port = stats.get(args.tx_port) or {}
+    port = port_stats(stats, args.tx_port) or {}
     out = {
         "tx": int(port.get("opackets", 0) or 0),
         "tx_bytes": int(port.get("obytes", 0) or 0),
@@ -476,22 +535,134 @@ def sample(client, args, pg_ids, counted_all):
         "rx": 0,
         "source": "none",
     }
+    # The receiving port's own counter, read whether or not flow stats are in
+    # play. It is the only thing that can contradict a zero from the groups,
+    # and a zero that nothing can contradict is how a working link gets
+    # reported as a dead one.
+    rx_entry = port_stats(stats, args.rx_port)
+    port_rx = int((rx_entry or {}).get("ipackets", 0) or 0)
+
     groups = stats.get("flow_stats") or {}
     seen = [groups[pg] for pg in pg_ids if pg in groups]
     if seen:
-        out["rx"] = sum(total(g.get("rx_pkts")) for g in seen)
+        group_rx = sum(total(g.get("rx_pkts")) for g in seen)
+        out["rx"] = group_rx
         if counted_all:
             # Per-group counters in hardware on both sides. This is the one
-            # reading here that goes into a report without a caveat.
+            # reading here that goes into a report without a caveat - but only
+            # while it is not being contradicted.
             out["tx"] = sum(total(g.get("tx_pkts")) for g in seen) or out["tx"]
             out["source"] = "flow_stats"
         else:
             out["source"] = "mixed"
+        # The contradiction that matters: the groups counted nothing on the
+        # receive side while the port counted plenty. Some cards and drivers
+        # count transmission per group and never the reception, and trusting
+        # the group there turns "everything arrived" into "100% loss" with
+        # reliable=True on it - a confident wrong answer, which is worse than
+        # an unsure right one. The port counter wins, and says why.
+        if group_rx == 0 and port_rx > 0:
+            out["rx"] = port_rx
+            out["source"] = "flow_stats_blind"
+        elif group_rx == 0 and rx_entry is None and args.rx_port >= 0:
+            # A zero nothing was able to contradict. It may well be the truth,
+            # but it is exactly the shape a blind driver produces, and the one
+            # reading that would have told them apart is missing. Saying so
+            # costs a caveat; not saying so costs somebody a day on a link that
+            # was fine.
+            out["source"] = "flow_stats_unverified"
     elif args.rx_port >= 0:
-        rx_port = stats.get(args.rx_port) or {}
-        out["rx"] = int(rx_port.get("ipackets", 0) or 0)
+        out["rx"] = port_rx
         out["source"] = "port_counter"
     return out
+
+
+def start_capture(client, args, quiet):
+    """Begin recording both directions. Returns the handles, or None.
+
+    Automatic rather than asked for. A run whose frames were not kept can
+    answer "сколько" and never "что именно" - and the second question is the
+    one that comes up a week later, when the counters are all anyone has and
+    nobody remembers what was actually on the wire.
+
+    This is TRex's software capture: frames are copied up to the control
+    plane, so it cannot follow a line-rate run. Hence the limit, and hence the
+    limit being said out loud rather than a partial recording being presented
+    as a whole one.
+    """
+    if not args.capture:
+        return None
+    handles = {}
+    ports = sorted({args.tx_port} | ({args.rx_port} if args.rx_port >= 0
+                                     else set()))
+    try:
+        # TRex records nothing at all unless the port is in service mode: the
+        # frames have to come up through the software path to be copied, and
+        # in the fast path they never do. It costs rate, which is why the
+        # result says the run was recorded instead of leaving the operator to
+        # discover the ceiling and blame the device for it.
+        client.set_service_mode(ports=ports, enabled=True)
+        for kind, port in (("tx", args.tx_port), ("rx", args.rx_port)):
+            if port < 0:
+                continue
+            spec = {"limit": args.capture_limit, "mode": "fixed"}
+            spec["tx_ports" if kind == "tx" else "rx_ports"] = [port]
+            handles[kind] = client.start_capture(**spec)["id"]
+    except Exception as exc:
+        emit(quiet, ev="note",
+             msg="захват не начался (%s) - прогон идёт без записи кадров" % exc)
+        try:
+            client.set_service_mode(ports=ports, enabled=False)
+        except Exception:
+            pass
+        return None
+    emit(quiet, ev="note",
+         msg="идёт запись кадров, до %d на сторону; порты в сервисном режиме, "
+             "потолок скорости в этом прогоне ниже обычного"
+             % args.capture_limit)
+    return handles
+
+
+def stop_capture(client, args, handles, quiet):
+    """Write each direction out and ship it back inside the event stream.
+
+    The pcap is written on the machine that did the sending and has to reach
+    the machine that will open it. It travels as base64 in the events rather
+    than being left behind for somebody to collect: the generator is shared,
+    and a tool that scatters files across a shared box is a tool people stop
+    running.
+    """
+    if not handles:
+        return
+    folder = tempfile.mkdtemp(prefix="traphy-cap-")
+    try:
+        for kind, handle in sorted(handles.items()):
+            path = os.path.join(folder, "%s.pcap" % kind)
+            try:
+                client.stop_capture(handle, output=path)
+            except Exception as exc:
+                emit(quiet, ev="note",
+                     msg="запись %s не сохранилась: %s" % (kind, exc))
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+            except OSError as exc:
+                emit(quiet, ev="note", msg="запись %s не прочиталась: %s"
+                     % (kind, exc))
+                continue
+            ship_pcap(kind, raw, quiet, args.capture_limit)
+            if kind == "tx" and raw:
+                # Запись отправки снимается до выгрузки на карту, поэтому
+                # контрольные суммы в ней могут быть не посчитаны. Кадр от
+                # этого не испорчен - испорчен вывод, если проверять
+                # целостность по этой стороне.
+                emit(quiet, ev="note",
+                     msg="в записи отправки контрольные суммы могут быть "
+                         "не посчитаны - захват идёт до выгрузки на карту; "
+                         "целостность кадра проверяй по записи приёма")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def run(api, args, streams, pg_ids, uncounted, quiet):
@@ -503,14 +674,31 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
 
     client = api.STLClient(server=args.server, sync_port=args.sync_port)
     client.connect()
+    # Оба до try: в finally они читаются, а дотуда можно долететь и с отказа на
+    # самом захвате портов, когда ни то, ни другое ещё не заводилось.
+    service_on = False
+    handles = None
     try:
-        client.reset(ports=ports)
+        take_ports(client, args, ports, quiet)
         client.add_streams(streams, ports=[args.tx_port])
-        client.clear_stats()
+        handles = start_capture(client, args, quiet)
+        service_on = bool(handles)
 
         started = time.time()
+        # force здесь - НЕ про отъём чужого: порты уже наши, а отобрать их
+        # мог только acquire выше, и он вежливый. Продавливать приходится две
+        # свои же вещи, и обе законные:
+        #
+        #   - собственный сервисный режим: запись кадров без него невозможна,
+        #     а стартовать на порту в этом режиме TRex без force отказывается.
+        #     Не форсировать тут значит сломать запись целиком;
+        #   - явное --force оператора.
+        #
+        # Без записи и без --force старт остаётся неформированным нарочно:
+        # тогда TRex откажется стартовать на порту с упавшим линком, и это
+        # правильный ответ - иначе весь прогон вернётся как «потери 100%».
         client.start(ports=[args.tx_port], duration=args.duration,
-                     mult=args.mult, force=True)
+                     mult=args.mult, force=bool(args.force or handles))
         # A hard stop past the asked-for duration: a profile made only of
         # bursts finishes early, and a server that never reports the traffic as
         # stopped must not hold the run open for ever.
@@ -537,7 +725,38 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         # receiving counter is read, or the tail of the run reads as loss.
         time.sleep(0.5)
         final = sample(client, args, pg_ids, counted_all)
+        stop_capture(client, args, handles, quiet)
+        handles = None            # забрали, дальше снимать нечего
     finally:
+        # Обратно в быстрый тракт - ЧТО БЫ НИ СЛУЧИЛОСЬ. Раньше это снималось
+        # в stop_capture, до которого при отказе посреди прогона дело не
+        # доходило: порты оставались в сервисном режиме навсегда, а следующий
+        # прогон без записи отказывался стартовать вовсе. На общей машине это
+        # отравляет стенд всем, и связать это с записью, снятой часами раньше,
+        # не сможет никто.
+        # Сначала снять записи, и только потом режим: пока запись жива, TRex
+        # отказывается выключать сервисный режим - "unable to disable service
+        # mode - an active capture exists". Прогон, умерший между стартом
+        # записи и её снятием, оставлял на машине и то, и другое.
+        if handles:
+            for handle in handles.values():
+                try:
+                    client.stop_capture(handle)
+                except Exception:
+                    pass
+        if service_on:
+            try:
+                client.set_service_mode(ports=ports, enabled=False)
+            except Exception:
+                pass
+        # Handed back explicitly rather than left to the disconnect: a release
+        # that happens only as a side effect of closing the socket does not
+        # happen when the socket is already gone, and the next person finds
+        # the ports owned by a run that ended.
+        try:
+            client.release(ports=ports)
+        except Exception:
+            pass
         try:
             client.disconnect()
         except Exception:
@@ -547,6 +766,10 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
 
     source = final["source"]
     note = SOURCE_NOTES.get(source, "")
+    if source == "flow_stats" and final["rx"] > final["tx"]:
+        note = ("аппаратный счёт дал больше, чем отправлено (%d против %d) - "
+                "в группу попало не только наше; цифра приёма по этому прогону "
+                "ничего не измеряет" % (final["rx"], final["tx"]))
     if uncounted and source == "mixed":
         # Worth naming only when the rest of the run *was* counted in hardware.
         # When nothing was, "these streams had no counter" lists every stream
@@ -559,7 +782,12 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         "seconds": round(seconds, 3),
         "achieved_pps": round(final["tx"] / seconds, 1) if seconds else 0.0,
         "rx_source": source,
-        "reliable": source == "flow_stats",
+        # Только НЕОПРОВЕРГНУТЫЙ аппаратный счёт годится как есть. Принято
+        # больше, чем послано, - это и есть опровержение: столько наших кадров
+        # вернуться не могло, значит в счёт попало чужое. Найдено на стенде
+        # 2026-09-30: группа насчитала 46 млн при 20 тысячах отправленных, и
+        # прогон уходил с пометкой «надёжно».
+        "reliable": source == "flow_stats" and final["rx"] <= final["tx"],
         "truncated": [],
         "note": note,
     }
@@ -583,8 +811,19 @@ def parse_args(argv=None):
                     help="множитель скорости: 1, 50%%, 100kpps, 1gbps")
     ap.add_argument("--count", type=int, default=0,
                     help="не поддерживается: TRex шлёт по времени")
+    ap.add_argument("--capture", action="store_true",
+                    help="записывать отправленные и принятые кадры "
+                         "и вернуть их вместе с результатом")
+    ap.add_argument("--capture-limit", type=int, default=1000,
+                    help="сколько кадров сохранять на сторону")
     ap.add_argument("--pcap", default="",
-                    help="куда записать образцы кадров (по одному на поток)")
+                    help="куда записать образцы кадров (по одному на поток) - "
+                         "путь на ЭТОЙ машине, для запуска скрипта руками")
+    ap.add_argument("--ship-frames", action="store_true",
+                    help="вернуть образцы кадров вызывающему внутри потока "
+                         "событий, ничего здесь не оставляя")
+    ap.add_argument("--force", action="store_true",
+                    help="отобрать порты, даже если их держит чужой прогон")
     ap.add_argument("--dry-run", action="store_true",
                     help="собрать профиль и показать, демону ничего не отдавая")
     ap.add_argument("--quiet", action="store_true",
@@ -642,6 +881,23 @@ def main(argv=None):
              msg="в %s записаны образцы кадров - по одному на поток, такими, "
                  "какими их собрали до field engine" % args.pcap)
 
+    if args.ship_frames:
+        # Домой внутри потока событий, как и записанные кадры, и по той же
+        # причине: скрипт исполняется на машине-генераторе, а каталог прогона
+        # живёт на машине, которая его запустила. Путь оттуда сюда не годится -
+        # его тут просто нет, и запись по нему роняет прогон до первого кадра.
+        folder = tempfile.mkdtemp(prefix="traphy-frames-")
+        try:
+            path = os.path.join(folder, "streams.pcap")
+            write_pcap(path, frames)
+            with open(path, "rb") as fh:
+                ship_pcap("streams", fh.read(), quiet)
+        except Exception as exc:
+            emit(quiet, ev="note",
+                 msg="образцы кадров не отправились: %s" % exc)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
     if args.dry_run:
         for stream, frame in zip(streams, frames):
             name = getattr(stream, "name", "?")
@@ -655,6 +911,12 @@ def main(argv=None):
 
     try:
         result = run(api, args, streams, pg_ids, uncounted, quiet)
+    except Busy as exc:
+        # Its own exit code: "somebody else is on the generator" is a thing to
+        # wait out, not a fault to go and debug.
+        emit(quiet, ev="error", msg=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 4
     except Exception as exc:
         # The release defines its own exception types and we only have them
         # after the import above, so there is nothing narrower to catch here
@@ -662,6 +924,11 @@ def main(argv=None):
         msg = "TRex на %s:%d - %s" % (args.server, args.sync_port, exc)
         emit(quiet, ev="error", msg=msg)
         print(msg, file=sys.stderr)
+        # И стек следом. Сообщение говорит ЧТО, стек говорит ГДЕ, и без второго
+        # отказ вроде "Failed to send message to server" не сужается ничем:
+        # он одинаково выглядит и на подключении, и на запуске. Архив прогона
+        # затем и ведётся, чтобы через неделю не переигрывать отказ заново.
+        traceback.print_exc()
         return 1
 
     emit(quiet, ev="done", **result)

@@ -21,7 +21,7 @@ from traphy import codegen, ui
 from traphy.runner import RunResult, RunSpec, execute as do_run, recent_runs
 from traphy.session import Session
 from traphy.strings import t
-from traphy.transport import TransportError
+from traphy.transport import TransportError, sudo_password
 
 
 # --------------------------------------------------------------------------- #
@@ -53,8 +53,11 @@ def script_screen(session: Session) -> None:
         if status:
             panel.append(ui.c("  " + status.lstrip("! "),
                               "bad" if status.startswith("!") else "ok"))
-        panel.append(ui.c(f"  строки {top + 1}-{top + len(shown)} из {len(lines)}"
-                          f"   ·   s сохранить   ·   {t('keys_scroll')}", "dim"))
+        # Через словарь: собранная здесь строка оставалась русской при
+        # английском языке, и подвал экрана выходил наполовину переведённым.
+        panel.append(ui.c("  " + t("script_pager", a=top + 1,
+                                   b=top + len(shown), n=len(lines),
+                                   keys=t("keys_scroll")), "dim"))
         ui.draw(ui.panel(panel, ui.WIDE))
         status = ""
 
@@ -154,7 +157,11 @@ class _Live:
             self.result = do_run(
                 self.session.profile, self.session.target, self.spec,
                 on_event=self.on_event, password=self.session.password,
-                transport=self.session.transport)
+                transport=self.session.transport,
+                # Обычная стендовая машина не пускает sudo без пароля, и без
+                # него прогон падал ещё до старта скрипта. Пароль берётся из
+                # окружения и здесь не хранится - см. transport.SUDO_PASSWORD_ENV.
+                sudo_password=sudo_password())
         except TransportError as exc:
             self.error = str(exc)
         except Exception as exc:
@@ -224,13 +231,25 @@ def result_screen(result: RunResult) -> None:
         _counter(t("l_sent"), f"{result.tx_pkts:,}".replace(",", " ")
                  + f"  ({result.tx_bytes / 1e6:.1f} МБ)"),
     ]
+    count = f"{result.rx_pkts:,}".replace(",", " ")
     if result.reliable:
-        lines.append(_counter(t("l_recv"), f"{result.rx_pkts:,}".replace(",", " ")))
+        lines.append(_counter(t("l_recv"), count))
         role = "ok" if result.loss_pct < 0.01 else "warn" if result.loss_pct < 1 else "bad"
         lines.append(_counter(t("l_loss"),
                               ui.c(f"{result.loss_pkts} ({result.loss_pct:.3f}%)", role)))
-    else:
+    elif result.rx_source == "none":
         lines.append(_counter(t("l_recv"), ui.c(t("l_unmeasured"), "warn")))
+    else:
+        # Измерено, но веры нет. Писать тут «не мерялось» значило спорить с
+        # предупреждением строкой ниже, которое ту же цифру и цитирует: на
+        # стенде экран сообщал «принято: не мерялось», а под ним стояло
+        # «принято больше, чем отправлено (142 250 747)».
+        lines.append(_counter(t("l_recv"), count + ui.c(
+            f"   {t('l_approx')} ({result.rx_source})", "warn")))
+        if result.rx_pkts <= result.tx_pkts:
+            lines.append(_counter(t("l_loss"), ui.c(
+                f"{result.loss_pkts} ({result.loss_pct:.3f}%)   "
+                f"{t('l_approx')}", "warn")))
     lines.append(_counter(t("l_rate"),
                           f"{result.achieved_pps:,.0f} pps".replace(",", " ")
                           + (f"  из {result.requested_pps:,.0f} запрошенных".replace(",", " ")

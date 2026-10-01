@@ -28,6 +28,7 @@ prints only human text.
 
 from __future__ import annotations
 
+from traphy import codegen_ship
 from traphy.models import FieldTarget, L4Proto, Profile, Stream, TxMode, VMOp
 
 # How many frames a single inc/dec range may expand to. A /16 sweep is 65k
@@ -50,7 +51,7 @@ def generate(profile: Profile, tag: str = DEFAULT_TAG) -> str:
     enabled = profile.enabled_streams
     skipped = [s.name for s in profile.streams if not s.enabled]
 
-    parts = [_header(profile, skipped, tag), _HELPERS]
+    parts = [_header(profile, skipped, tag), _HELPERS, codegen_ship.SHIP]
     for i, s in enumerate(enabled):
         parts.append(_builder(s, i))
     parts.append(_stream_table(enabled))
@@ -107,10 +108,14 @@ def _header(profile: Profile, skipped: list[str], tag: str) -> str:
 # --rx-iface; без него приём не измеряется и в отчёте так и написано.
 # ---------------------------------------------------------------------------
 import argparse
+import base64
 import ipaddress
 import json
+import os
 import random
+import shutil
 import sys
+import tempfile
 import time
 
 from scapy.all import AsyncSniffer, Dot1Q, Ether, IP, TCP, UDP, conf, wrpcap
@@ -341,9 +346,19 @@ class Pacer:
         return take
 
     def finished(self):
-        """True when this stream has nothing left to do, ever."""
+        """True when this stream has nothing left to do, ever.
+
+        A burst stream can run out two ways and this used to notice only one:
+        the bursts ran out, or its share of --count did. Hitting the count
+        while a burst was still scheduled left it reporting "не закончил"
+        forever - and since --count also removes the deadline, nothing else
+        was left to stop the run. It span in place until the transport gave
+        up, which looks exactly like a hung target.
+        """
+        if self.done:
+            return True
         if self.mode == "continuous":
-            return self.count and self.sent >= self.count
+            return bool(self.count) and self.sent >= self.count
         return self.next_burst_at == float("inf") and self.owed < 1
 
 
@@ -370,9 +385,15 @@ def run(args, built, quiet):
         share = int(args.count * spec["pps"] / total_pps) if args.count else 0
         pacers.append((Pacer(scaled, share), raws))
 
+    # Кадры, которые реально ушли в сокет - не те, что собраны. Собранный
+    # набор и отправленный совпадают только до первого лимита по времени;
+    # дамп с именем tx.pcap обязан показывать второе.
+    kept_tx = []
+
     sniffer = None
     if args.rx_iface:
-        sniffer = AsyncSniffer(iface=args.rx_iface, store=bool(args.rx_pcap),
+        sniffer = AsyncSniffer(iface=args.rx_iface,
+                               store=bool(args.rx_pcap or args.capture),
                                lfilter=lambda p: TAG in bytes(p))
         sniffer.start()
         # Give the sniffer a moment to attach; frames sent into a socket that
@@ -396,6 +417,8 @@ def run(args, built, quiet):
                 for _ in range(pacer.due(now)):
                     raw = raws[cursors[index] % len(raws)]
                     sock.send(raw)
+                    if args.capture and len(kept_tx) < args.capture_limit:
+                        kept_tx.append(raw)
                     cursors[index] += 1
                     pacer.sent += 1
                     tx += 1
@@ -418,15 +441,103 @@ def run(args, built, quiet):
     rx, rx_frames = stop_sniffer(sniffer)
     if args.rx_pcap and rx_frames:
         wrpcap(args.rx_pcap, rx_frames)
+    if args.capture:
+        ship_capture(args, kept_tx, rx_frames, quiet)
 
     return {
         "tx": tx, "tx_bytes": tx_bytes, "rx": rx,
         "seconds": round(seconds, 3),
         "achieved_pps": round(tx / seconds, 1) if seconds else 0.0,
         "rx_source": "marker" if sniffer is not None else "none",
-        "reliable": sniffer is not None,
+        # A sniffer matching a marker in the payload counts only our frames,
+        # which is worth a lot - and it is still software. Under rate it drops
+        # frames on its own, and then the loss column describes the sniffer
+        # rather than the device. So this figure always travels with its
+        # caveat, the same way a port counter does.
+        "reliable": False,
         "truncated": list(_TRUNCATED),
     }
+
+
+def ship_capture(args, kept_tx, rx_frames, quiet):
+    """Обе стороны прогона - в pcap и домой внутри событий.
+
+    Пишется во временный каталог и оттуда же убирается: на общей машине
+    после прогона не должно оставаться ничего, а открывать дамп всё равно
+    будут не здесь.
+    """
+    folder = tempfile.mkdtemp(prefix="traphy-cap-")
+    try:
+        sides = (("tx", [Ether(raw) for raw in kept_tx]),
+                 ("rx", list(rx_frames)[:args.capture_limit]))
+        for kind, frames in sides:
+            if not frames:
+                # НЕ "кадров не было" - см. codegen_ship.ship_pcap, там та же
+                # мысль и та же причина. Сниффер мог не успеть, метка могла не
+                # сойтись; пустая запись - свойство записи, а не приговор
+                # линку. А рядом стоит ноль приёма, и вместе это читается как
+                # доказательство потерь, которым не является.
+                emit(quiet, ev="note",
+                     msg="запись %s пуста - по этому НЕЛЬЗЯ судить о потерях: "
+                         "сниффер мог не успеть или не узнать кадры" % kind)
+                continue
+            path = os.path.join(folder, "%s.pcap" % kind)
+            try:
+                wrpcap(path, frames)
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+            except (OSError, ValueError) as exc:
+                emit(quiet, ev="note",
+                     msg="запись %s не сохранилась: %s" % (kind, exc))
+                continue
+            ship_pcap(kind, raw, quiet, args.capture_limit)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def link_mtu(iface):
+    """MTU интерфейса, или 0, если прочитать не вышло.
+
+    Ноль означает «не знаю», и это не то же самое, что «не влезет»: отказать
+    из-за нечитаемого файла было бы хуже, чем попробовать отправить.
+    """
+    try:
+        with open("/sys/class/net/%s/mtu" % iface) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def mtu_refusals(iface, built):
+    """Кадры, которые не пролезут в MTU, названные до отправки.
+
+    Без этой проверки слишком длинный кадр просто не уходит, и прогон
+    показывает стопроцентные потери - ровно так же, как погашенный порт или
+    чужой VLAN. Разница в том, что здесь виновата настройка на этой машине, а
+    искать её пойдут в коробке.
+
+    MTU задаёт размер полезной нагрузки поверх L2, поэтому к нему прибавляются
+    14 байт заголовка Ethernet и по 4 на каждый тег. FCS в наш размер не
+    входит - он и здесь ни при чём.
+    """
+    mtu = link_mtu(iface)
+    if mtu <= 0:
+        return []
+    out = []
+    for spec, frames, raws in built:
+        if not raws:
+            continue
+        longest = max(len(raw) for raw in raws)
+        tagged = 4 if any(Dot1Q in f for f in frames) else 0
+        allowed = mtu + 14 + tagged
+        if longest > allowed:
+            out.append(
+                "%s: кадр %d B не пролезет - на %s стоит MTU %d, что даёт "
+                "не больше %d B на кадр%s. Либо уменьши размер, либо подними "
+                "MTU на интерфейсе."
+                % (spec["name"], longest, iface, mtu, allowed,
+                   " (с тегом)" if tagged else ""))
+    return out
 
 
 def sniff_count(sniffer):
@@ -464,6 +575,11 @@ def parse_args(argv=None):
                     help="общая цель по pps; масштабирует потоки пропорционально")
     ap.add_argument("--pcap", default="", help="куда записать отправляемые кадры")
     ap.add_argument("--rx-pcap", default="", help="куда записать принятые кадры")
+    ap.add_argument("--capture", action="store_true",
+                    help="вернуть записанные кадры вызывающему в потоке "
+                         "событий; на машине отправки ничего не остаётся")
+    ap.add_argument("--capture-limit", type=int, default=1000,
+                    help="сколько кадров записать на сторону (по умолчанию 1000)")
     ap.add_argument("--dry-run", action="store_true",
                     help="собрать и показать кадры, ничего не отправляя")
     ap.add_argument("--quiet", action="store_true",
@@ -481,6 +597,13 @@ def main(argv=None):
         return 2
 
     built = build_all(quiet)
+    too_big = mtu_refusals(args.iface, built)
+    if too_big:
+        for line in too_big:
+            emit(quiet, ev="error", msg=line)
+            print(line, file=sys.stderr)
+        return 2
+
     frames = sum(len(r) for _, _, r in built)
     total_pps = sum(s["pps"] for s, _, _ in built)
     emit(quiet, ev="ready", frames=frames, iface=args.iface,

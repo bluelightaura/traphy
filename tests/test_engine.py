@@ -42,6 +42,13 @@ def run(source: str, argv: list[str]) -> tuple[int, list[dict]]:
     return rc, events
 
 
+def load(source: str) -> dict:
+    """Exec a generated script without running it, to poke at its helpers."""
+    namespace: dict = {"__name__": "generated"}
+    exec(compile(source, "generated.py", "exec"), namespace)
+    return namespace
+
+
 def final(events: list[dict]) -> dict:
     return next(e for e in events if e["ev"] == "done")
 
@@ -122,13 +129,66 @@ def test_without_a_receive_interface_the_result_says_so(fake_scapy):
 
 
 def test_with_a_receive_interface_the_catch_is_counted(fake_scapy, sniffer_catches):
+    """Counted, named - and never called reportable-as-is.
+
+    A sniffer matching a marker sees only our frames, which is worth more than
+    a port counter. It is still software: at rate it drops frames on its own,
+    and the loss column then describes the sniffer. So the figure always
+    carries its caveat.
+    """
     sniffer_catches(42)
     _rc, events = run(generate(Profile(streams=[Stream(rate_value=200)])),
                       ["--iface", "eth0", "--rx-iface", "eth1", "--duration", "0.2"])
     done = final(events)
     assert done["rx"] == 42
     assert done["rx_source"] == "marker"
-    assert done["reliable"] is True
+    assert done["reliable"] is False
+
+
+# --------------------------------------------------------------------------- #
+# MTU: the setting on this machine that looks exactly like a fault in the device
+# --------------------------------------------------------------------------- #
+def mtu_check(fake_scapy, frame_size, mtu, vlan=None):
+    """Run the script's own MTU check against a made-up interface size."""
+    stream = Stream(rate_value=10,
+                    packet=Packet(layer="l3", frame_size=frame_size, vlan=vlan))
+    ns = load(generate(Profile(streams=[stream])))
+    ns["link_mtu"] = lambda _iface: mtu
+    built = ns["build_all"](True)
+    return ns["mtu_refusals"]("eth0", built)
+
+
+def test_a_frame_that_will_not_fit_the_mtu_is_refused_before_it_is_sent(fake_scapy):
+    """Otherwise it simply does not go out, and the run reports 100% loss -
+    indistinguishable from a dead port or a wrong VLAN, except that the fault is
+    on this machine and everybody goes looking in the device."""
+    refusals = mtu_check(fake_scapy, frame_size=9000, mtu=1500)
+    assert len(refusals) == 1
+    assert "9000" in refusals[0] and "1500" in refusals[0]
+    assert "1514" in refusals[0]          # what the MTU actually allows
+
+
+def test_a_frame_that_exactly_fills_the_mtu_is_allowed(fake_scapy):
+    assert mtu_check(fake_scapy, frame_size=1514, mtu=1500) == []
+
+
+def test_a_tag_buys_four_more_bytes(fake_scapy):
+    """MTU covers the payload above L2, so the header and each tag sit on top.
+    A tagged 1518 fits a 1500 MTU; the same frame untagged at 1519 does not."""
+    assert mtu_check(fake_scapy, frame_size=1518, mtu=1500, vlan=100) == []
+    assert mtu_check(fake_scapy, frame_size=1519, mtu=1500) != []
+
+
+def test_an_unreadable_mtu_lets_the_run_proceed(fake_scapy):
+    """Zero means "не знаю", not "не влезет". Refusing over an unreadable file
+    would be worse than trying to send."""
+    assert mtu_check(fake_scapy, frame_size=9000, mtu=0) == []
+
+
+def test_the_refusal_names_the_interface_and_both_ways_out(fake_scapy):
+    line = mtu_check(fake_scapy, frame_size=9000, mtu=1500)[0]
+    assert "eth0" in line
+    assert "уменьши размер" in line and "подними" in line
 
 
 def test_a_truncated_range_is_reported_not_swallowed(fake_scapy):

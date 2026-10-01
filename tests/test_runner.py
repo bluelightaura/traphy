@@ -32,7 +32,8 @@ class ScriptedTransport(Transport):
     def describe(self) -> str:
         return "тест"
 
-    def run_stream(self, script, args, on_line, timeout=300, sudo=False):
+    def run_stream(self, script, args, on_line, timeout=300, sudo=False,
+                   secret=""):
         self.script, self.args, self.sudo = script, list(args), sudo
         for line in self.lines:
             on_line(line)
@@ -172,3 +173,157 @@ def test_summary_reads_differently_when_nothing_was_measured():
     assert "потери" in measured.summary()
     blind = RunResult(tx_pkts=10, seconds=1, reliable=False)
     assert "не измерялся" in blind.summary()
+
+
+def test_a_dry_run_does_not_complain_about_the_receive_port():
+    """"Приём не измерялся" is what a dry run is *for*. Advising the operator
+    to set a port they already set is how warnings stop being read."""
+    dry = RunResult(dry_run=True, engine="trex", rx_source="none", reliable=False)
+    assert not any("порт приёма" in w for w in dry.warnings())
+    wet = RunResult(dry_run=False, engine="trex", rx_source="none", reliable=False)
+    assert any("порт приёма" in w for w in wet.warnings())
+
+
+def test_a_dry_run_says_so_instead_of_reporting_zero_traffic():
+    assert "в кабель не ушло" in RunResult(dry_run=True).summary()
+
+
+def test_a_dry_run_still_reports_a_failing_script():
+    dry = RunResult(dry_run=True, rc=1, note="библиотека не нашлась")
+    assert any("кодом 1" in w for w in dry.warnings())
+
+
+def test_a_measured_but_unreliable_figure_is_shown_rather_than_denied():
+    """Calling a number on the screen "не измерялся" teaches the reader to
+    stop believing the line it is on."""
+    r = RunResult(tx_pkts=8000, rx_pkts=8001, seconds=8.0,
+                  rx_source="flow_stats_blind", reliable=False)
+    assert "rx=8001" in r.summary()
+    assert "приблизительно" in r.summary()
+
+
+def test_a_sniffer_count_carries_its_own_caveat():
+    """It sees only our frames, which beats a port counter - and it is still
+    software, so at rate the losses it reports are its own."""
+    warned = " ".join(RunResult(rx_source="marker", reliable=False,
+                                tx_pkts=1000, rx_pkts=990).warnings())
+    assert "сниффером по метке" in warned
+    assert "теряет их сам" in warned
+    assert "интерфейс приёма" not in warned   # it was measured, just softly
+
+
+def test_an_unmeasured_figure_still_says_so_plainly():
+    r = RunResult(tx_pkts=8000, rx_source="none", reliable=False)
+    assert "приём не измерялся" in r.summary()
+
+
+def test_a_recorded_run_says_what_the_recording_cost_it():
+    """Frames are copied through the software path to be captured, so the rate
+    ceiling drops. A throughput figure taken with recording on is a figure
+    about the recording - and somebody will otherwise blame the device."""
+    r = RunResult(engine="trex", reliable=True,
+                  captures={"tx": "/runs/x/tx.pcap", "rx": "/runs/x/rx.pcap"})
+    warned = " ".join(r.warnings())
+    assert "сервисном режиме" in warned
+    assert "tx, rx" in warned
+
+
+def test_a_run_without_recording_says_nothing_about_it():
+    assert not any("сервисном" in w for w in RunResult(reliable=True).warnings())
+
+
+def test_the_recording_caveat_names_the_cost_this_engine_actually_paid():
+    """Service mode is a TRex thing. Telling a Scapy operator about it sends
+    them looking for a setting their engine does not have."""
+    from traphy.runner.result import RunResult
+
+    captures = {"tx": "/x/tx.pcap", "rx": "/x/rx.pcap"}
+    scapy = RunResult(engine="scapy", captures=captures, tx_pkts=10,
+                      rx_pkts=10, reliable=True)
+    trex = RunResult(engine="trex", captures=captures, tx_pkts=10,
+                     rx_pkts=10, reliable=True)
+
+    said = "\n".join(scapy.warnings())
+    assert "сервисном режиме" not in said
+    assert "сниффер" in said
+    assert "сервисном режиме" in "\n".join(trex.warnings())
+
+
+def test_the_recording_caveat_lists_sending_before_receiving():
+    from traphy.runner.result import RunResult
+
+    result = RunResult(engine="scapy", tx_pkts=1, rx_pkts=1, reliable=True,
+                       captures={"rx": "/x/rx.pcap", "tx": "/x/tx.pcap"})
+    assert "(tx, rx)" in "\n".join(result.warnings())
+
+
+def test_receiving_more_than_was_sent_is_never_silently_fine():
+    """Найдено на петле: tx=200, rx=400, «потери 0.00%».
+
+    Отрицательные потери обрезаются в ноль, и прогон, по которому мерить
+    нечего, выглядел безупречным.
+    """
+    r = RunResult(engine="scapy", tx_pkts=200, rx_pkts=400,
+                  rx_source="marker", reliable=True)
+    said = " ".join(r.warnings())
+    assert "больше, чем отправлено" in said
+    assert "400" in said and "200" in said
+
+
+def test_an_ordinary_run_says_nothing_about_it():
+    r = RunResult(engine="scapy", tx_pkts=200, rx_pkts=200,
+                  rx_source="marker", reliable=True)
+    assert not any("больше, чем отправлено" in w for w in r.warnings())
+
+
+def test_sample_frames_do_not_borrow_the_caveat_that_belongs_to_a_recording():
+    """Образцы кадров (по одному на поток, собранные до field engine) приезжают
+    в тот же архив, что и запись трафика. Но сервисного режима они не стоили, и
+    объяснять цену, которой не было, - тот же обман, что и молчать о настоящей.
+    """
+    r = RunResult(engine="trex", rx_source="flow_stats", reliable=True,
+                  tx_pkts=10, rx_pkts=10,
+                  captures={"streams": "/runs/x/streams.pcap"})
+    assert r.recorded_traffic() == []
+    assert not any("сервисн" in w for w in r.warnings())
+
+    r.captures["rx"] = "/runs/x/rx.pcap"
+    assert r.recorded_traffic() == ["rx"]
+    said = [w for w in r.warnings() if "сервисн" in w]
+    assert said and "streams" not in said[0]
+
+
+def test_more_received_than_sent_prints_no_loss_percentage():
+    """Найдено на стенде 2026-09-30: приёмный счётчик набрал 30 млн против
+    50 тысяч отправленных, и сводка сообщала «потери 0.00%». Арифметически
+    так и есть, и означает это ровно ничего - а выглядит как отличный прогон.
+    """
+    r = RunResult(engine="trex", rx_source="flow_stats_blind", reliable=False,
+                  tx_pkts=50_000, rx_pkts=30_627_011, seconds=5.0)
+    said = r.summary()
+    assert "потери не считаются" in said
+    assert "0.00%" not in said
+    assert any("больше, чем отправлено" in w for w in r.warnings())
+
+
+def test_a_configured_receive_port_is_never_advised_to_be_configured():
+    """Найдено на стенде 2026-09-30. Аппаратный счёт потерял доверие из-за
+    чужого трафика - и отчёт советовал «задай порт приёма», при заданном порте
+    и измеренном приёме. Совет настроить уже настроенное - ровно то, после чего
+    предупреждения перестают читать."""
+    r = RunResult(engine="trex", rx_source="flow_stats", reliable=False,
+                  tx_pkts=20_001, rx_pkts=140_301_868)
+    said = r.warnings()
+    assert not any("задай порт приёма" in w for w in said)
+    assert any("больше, чем отправлено" in w for w in said)
+
+
+def test_a_run_that_really_measured_nothing_still_says_what_to_do():
+    r = RunResult(engine="trex", rx_source="none", reliable=False, tx_pkts=100)
+    assert any("задай порт приёма" in w for w in r.warnings())
+
+
+def test_an_unverifiable_zero_explains_itself():
+    r = RunResult(engine="trex", rx_source="flow_stats_unverified",
+                  reliable=False, tx_pkts=100, rx_pkts=0)
+    assert any("сверить было нечем" in w for w in r.warnings())
