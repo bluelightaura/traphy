@@ -24,6 +24,11 @@ from traphy.target import state_dir
 # enough that the launcher stays a glance rather than a log.
 MAX_RUNS = 6
 
+# How many past values to keep per field. Five is the number that fits under a
+# field without the list becoming something to read: the point is recognising
+# the address typed last week, not browsing a log of everything ever entered.
+MAX_RECENT = 5
+
 LANGS = ("ru", "en")
 THEMES = ("dark", "light")
 
@@ -33,6 +38,10 @@ _DEFAULTS: dict[str, Any] = {
     "target": "",
     "profile": "",
     "runs": [],
+    # Per-field: values this person has entered before, newest first. UI memory
+    # like everything else here, and never anything secret - a field marked as
+    # such is not remembered at all.
+    "recent": {},
 }
 
 
@@ -49,6 +58,7 @@ def load_prefs() -> dict[str, Any]:
     """
     prefs = dict(_DEFAULTS)
     prefs["runs"] = []
+    prefs["recent"] = {}
     try:
         raw = json.loads(state_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -63,6 +73,7 @@ def load_prefs() -> dict[str, Any]:
         if isinstance(raw.get(key), str):
             prefs[key] = raw[key]
     prefs["runs"] = _clean_runs(raw.get("runs"))
+    prefs["recent"] = _clean_recent(raw.get("recent"))
     return prefs
 
 
@@ -80,6 +91,42 @@ def _clean_runs(runs: Any) -> list[dict[str, str]]:
     return out
 
 
+def _clean_recent(recent: Any) -> dict[str, list[str]]:
+    """Past values per field, with anything of the wrong shape dropped.
+
+    Read defensively for the same reason as the rest of this file: the state
+    file is ours, and a hand-edited one must degrade to "nothing remembered"
+    rather than reach the chooser and take a screen down.
+    """
+    if not isinstance(recent, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for key, values in recent.items():
+        if not isinstance(key, str) or not isinstance(values, list):
+            continue
+        kept = [v for v in values if isinstance(v, str) and v.strip()]
+        if kept:
+            out[key] = kept[:MAX_RECENT]
+    return out
+
+
+def remember_value(prefs: dict[str, Any], key: str, value: str) -> dict[str, Any]:
+    """Push a value onto the front of one field's list, newest first.
+
+    Re-entering a value moves it up rather than duplicating it: the list is
+    "what you use", and a value used twice is more likely, not less.
+    """
+    value = (value or "").strip()
+    if not key or not value:
+        return prefs
+    recent = _clean_recent(prefs.get("recent"))
+    values = [v for v in recent.get(key, []) if v != value]
+    values.insert(0, value)
+    recent[key] = values[:MAX_RECENT]
+    prefs["recent"] = recent
+    return prefs
+
+
 def save_prefs(prefs: dict[str, Any]) -> bool:
     """Persist the preferences. False when the write could not happen.
 
@@ -89,6 +136,7 @@ def save_prefs(prefs: dict[str, Any]) -> bool:
     path = state_path()
     payload = {key: prefs.get(key, _DEFAULTS[key]) for key in _DEFAULTS}
     payload["runs"] = _clean_runs(payload.get("runs"))
+    payload["recent"] = _clean_recent(payload.get("recent"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")

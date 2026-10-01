@@ -199,14 +199,62 @@ def bar(fraction: float, width: int = 30) -> str:
 # --------------------------------------------------------------------------- #
 # Screen and input
 # --------------------------------------------------------------------------- #
+# Настройки терминала, какими они были до открытия экрана. Пока экран открыт,
+# терминал держится без эха и без построчной буферизации - и это не украшение:
+# раньше режим возвращался в исходный после КАЖДОГО нажатия, то есть всё время
+# перерисовки терминал эхоил и копил ввод построчно. Клавиша, нажатая в этот
+# момент, печаталась поверх панели (`^[[B` посреди меню) и не доходила до
+# программы, пока не нажмут Enter. Быстрая прокрутка стрелками теряла нажатия.
+#
+# Сигналы остаются включёнными, в отличие от полного raw-режима: Ctrl-C
+# прерывает как обычно, и терминал, который не даёт себя настроить, отвечает
+# отказом сразу, а не вешает сессию.
+_cooked: list | None = None
+
+
+def _hold_keys() -> None:
+    """Забрать клавиатуру на время экрана."""
+    global _cooked
+    if _cooked is not None or not interactive():
+        return
+    import termios
+
+    fd = sys.stdin.fileno()
+    try:
+        _cooked = termios.tcgetattr(fd)
+        quiet = list(_cooked)
+        quiet[3] &= ~(termios.ECHO | termios.ICANON)   # lflag
+        quiet[6] = list(quiet[6])                       # cc
+        quiet[6][termios.VMIN] = 1
+        quiet[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
+    except termios.error:
+        _cooked = None
+
+
+def _release_keys() -> None:
+    """Вернуть клавиатуру оболочке. Обязано отработать и после падения."""
+    global _cooked
+    if _cooked is None:
+        return
+    import contextlib
+    import termios
+
+    with contextlib.suppress(termios.error):
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _cooked)
+    _cooked = None
+
+
 def enter_screen() -> None:
     """Switch to the alternate screen, so the shell scrollback survives."""
+    _hold_keys()
     if use_color():
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
 
 
 def leave_screen() -> None:
+    _release_keys()
     if use_color():
         sys.stdout.write("\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
@@ -230,19 +278,36 @@ def interactive() -> bool:
     return True
 
 
-def read_key() -> str:
+def read_key(timeout: float | None = None) -> str:
     """One keypress as a token: up/down/left/right/enter/esc, or a character.
 
     Raw mode is entered for exactly one read, so a Ctrl-C or a terminal that
     refuses raw mode surfaces immediately instead of wedging the session.
+    Between reads the terminal stays quiet rather than cooked - see
+    :func:`_hold_keys` - so type-ahead is neither echoed nor swallowed.
+
+    With ``timeout`` the wait gives up after that many seconds and returns "".
+    That is what lets a screen show something that changes on its own - a link
+    indicator, a counter - without a keypress to drive the redraw. Without it
+    the loop blocks on input, and anything moving on the screen would freeze
+    until the operator happened to touch a key.
     """
+    import select
     import termios
     import tty
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
+        # TCSANOW, а не TCSAFLUSH, который tty.setraw ставит по умолчанию:
+        # он выбрасывает уже набранный ввод. То есть каждое чтение клавиши
+        # стирало всё, что человек успел нажать, пока рисовался экран -
+        # быстрая прокрутка стрелками теряла нажатия и выглядела как залипание.
+        tty.setraw(fd, termios.TCSANOW)
+        if timeout is not None:
+            ready, _w, _x = select.select([sys.stdin], [], [], timeout)
+            if not ready:
+                return ""
         char = sys.stdin.read(1)
         if char == "\x1b":
             # An arrow arrives as ESC [ A-D; a bare Esc is the key itself.

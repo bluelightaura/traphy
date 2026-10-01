@@ -71,7 +71,14 @@ class Target:
     ssh_user: str = ""
     ssh_port: int = 22
     ssh_key: str = ""              # path to a private key; empty = agent/default
-    strict_host_key: bool = True   # refuse a host not already in known_hosts
+    # What to do about a host key we have not seen: "strict" refuses it,
+    # "accept-new" takes it once and writes it to known_hosts. A key that has
+    # CHANGED is refused either way - see traphy.transport.HOST_KEY_MODES.
+    host_key: str = "strict"
+    # Optional and stronger than known_hosts: the machine has to show exactly
+    # this fingerprint. Worth setting on a shared bench, where a box being
+    # reinstalled and a box being swapped look identical from here.
+    host_key_fingerprint: str = ""
 
     python: str = "python3"        # interpreter on the target
     use_sudo: bool = True          # raw sockets need root on the sending side
@@ -89,6 +96,11 @@ class Target:
     trex_sync_port: int = 4501     # its control port
     trex_port_tx: int = 0
     trex_port_rx: int = -1         # -1 = not set, so loss is not measured
+    # Take ports that somebody else holds. Off by default for the same
+    # reason as on Ixia: the generator is shared, and a run that quietly
+    # evicts a colleague breaks their measurement without telling either
+    # of you.
+    trex_force: bool = False
 
     # Ixia is not a machine at all: the traffic comes out of a chassis in a
     # rack, configured through an API server, and the client runs here. So a
@@ -112,6 +124,58 @@ class Target:
     def is_local(self) -> bool:
         """True when the script runs here, with no SSH hop in between."""
         return not self.use_ssh or self.host in ("", "127.0.0.1", "localhost", "::1")
+
+    def adopt(self, info: Any) -> list[str]:
+        """Взять с цели то, что она рассказала о себе. Что изменилось - вернуть.
+
+        Берётся только то, что машина знает лучше человека и может назвать
+        сама: где лежит релиз, сколько у демона портов, какую линию он
+        объявляет. Всё остальное - адрес, логин, пароль, режим ключа хоста -
+        не трогается: этого цель про себя не знает, и подставить туда догадку
+        значит сломать вход ради удобства.
+
+        Список изменений возвращается, а не пишется в лог, потому что молчаливо
+        переписанное поле - это поле, в котором потом ищут свою же опечатку.
+        """
+        changed: list[str] = []
+
+        def put(field: str, value: Any, said: str) -> None:
+            if getattr(self, field) != value:
+                changed.append(said)
+                setattr(self, field, value)
+
+        if getattr(info, "has_trex_stl", False) and info.trex_dir:
+            put("trex_dir", info.trex_dir, f"каталог релиза: {info.trex_dir}")
+        # Демон живёт на самой цели, а скрипт уже выполняется там же. Внешний
+        # адрес в этом поле не даёт ничего: наличие демона и проверяется на
+        # 127.0.0.1.
+        if getattr(info, "trex_daemon", False):
+            put("trex_server", "127.0.0.1", "демон: 127.0.0.1 (он на самой цели)")
+
+        ports = int(getattr(info, "trex_ports", 0) or 0)
+        if ports:
+            put("trex_port_tx", 0, "порт отправки: 0")
+            if ports >= 2:
+                put("trex_port_rx", 1, "порт приёма: 1")
+            else:
+                put("trex_port_rx", -1,
+                    "порт приёма снят: у демона всего один порт, ловить нечем")
+
+        mbit = int(getattr(info, "trex_link_mbit", 0) or 0)
+        if mbit:
+            put("link_mbit", mbit, f"скорость линии: {mbit} Мбит/с")
+        return changed
+
+    def disagrees_with(self, info: Any) -> list[str]:
+        """Чем цель расходится с тем, что машина рассказала о себе.
+
+        Тот же расчёт, что и :meth:`adopt`, но на копии: узнать о расхождении
+        человек должен раньше, чем прогон не пойдёт, и без того чтобы у него
+        под руками что-то молча поменялось.
+        """
+        import copy
+
+        return copy.deepcopy(self).adopt(info)
 
     def endpoint(self) -> str:
         """A short "where am I sending from" for the menu's header line."""
@@ -165,7 +229,14 @@ class Target:
             ssh_user=str(d.get("ssh_user", "")),
             ssh_port=int(d.get("ssh_port", 22)),
             ssh_key=str(d.get("ssh_key", "")),
-            strict_host_key=bool(d.get("strict_host_key", True)),
+            # Targets written by an earlier build carry a boolean. False used
+            # to mean "accept anything, remember nothing", which is the one
+            # behaviour no mode offers any more; it maps to accept-new, which
+            # is what that setting was always reaching for.
+            host_key=str(d.get("host_key")
+                         or ("strict" if d.get("strict_host_key", True)
+                             else "accept-new")),
+            host_key_fingerprint=str(d.get("host_key_fingerprint", "")),
             python=str(d.get("python", "python3")),
             use_sudo=bool(d.get("use_sudo", True)),
             tx_iface=str(d.get("tx_iface", "eth0")),
@@ -176,6 +247,7 @@ class Target:
             trex_sync_port=int(d.get("trex_sync_port", 4501)),
             trex_port_tx=int(d.get("trex_port_tx", 0)),
             trex_port_rx=int(d.get("trex_port_rx", -1)),
+            trex_force=bool(d.get("trex_force", False)),
             ixia_api_host=str(d.get("ixia_api_host", "")),
             ixia_api_port=int(d.get("ixia_api_port", 11009)),
             ixia_api_user=str(d.get("ixia_api_user", "")),

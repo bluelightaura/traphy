@@ -63,3 +63,25 @@ def test_bar_is_clamped_to_its_width():
 def test_colour_is_dropped_when_the_terminal_does_not_want_it(monkeypatch):
     monkeypatch.setattr(ui, "use_color", lambda: False)
     assert ui.c("текст", "ok") == "текст"
+
+
+def test_a_target_can_be_swapped_without_retyping_it():
+    """Два режима Scapy - это две цели, и переключаться между ними надо часто.
+    Без выбора каждое переключение означало перенабор адреса и интерфейсов."""
+    import copy
+
+    from traphy.target import Target
+
+    here = Target(name="pk", use_ssh=False, tx_iface="lo", rx_iface="lo")
+    there = Target(name="vm", host="10.0.0.9", ssh_user="кто-то", use_ssh=True,
+                   tx_iface="ens19", rx_iface="ens20")
+
+    draft = copy.deepcopy(here)
+    # Так же, как это делает экран: объект наполняется, а не подменяется -
+    # поля формы смотрят именно в него.
+    draft.__dict__.update(copy.deepcopy(there).__dict__)
+
+    assert draft.name == "vm"
+    assert draft.is_local is False
+    assert draft.tx_iface == "ens19"
+    assert "10.0.0.9" in draft.endpoint()

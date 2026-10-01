@@ -42,6 +42,9 @@ class Row:
     needs_link: bool = False        # locked until the target answered
     needs_traffic: bool = False     # locked until something is composed
     cycles: bool = False            # a preference row, not a screen
+    # Заголовок раздела. Печатается перед первой строкой раздела и сам строкой
+    # не является: по нему не встать курсором и нечего открыть.
+    section: str = ""
 
     def title(self) -> str:
         return t(f"{self.key}_title")
@@ -68,17 +71,26 @@ def _save(session: Session) -> None:
                "", ui.c("  " + t("keys_any"), "dim")], ui.WIDE)
 
 
+# Порядок - это порядок работы: сначала чем и откуда шлём, потом что именно,
+# потом прогон. Раньше это был плоский список, в котором цель, кадр и прогон
+# лежали вперемешку, и по нему не было видно, на каком ты шаге.
 ROWS: tuple[Row, ...] = (
-    Row("setup", connect_screens.target_screen),
-    Row("compose", _compose),
-    Row("streams", compose_screens.streams_screen, needs_traffic=True),
-    Row("script", execute_screens.script_screen, needs_traffic=True),
-    Row("dry", _dry, needs_traffic=True),
-    Row("run", execute_screens.run_screen, needs_link=True, needs_traffic=True),
-    Row("save", _save, needs_traffic=True),
-    Row("history", execute_screens.history_screen),
-    Row("lang", cycles=True),
-    Row("theme", cycles=True),
+    Row("setup", connect_screens.target_screen, section="sec_gen"),
+
+    Row("compose", _compose, section="sec_what"),
+    Row("streams", compose_screens.streams_screen, needs_traffic=True,
+        section="sec_what"),
+    Row("script", execute_screens.script_screen, needs_traffic=True,
+        section="sec_what"),
+    Row("save", _save, needs_traffic=True, section="sec_what"),
+
+    Row("dry", _dry, needs_traffic=True, section="sec_run"),
+    Row("run", execute_screens.run_screen, needs_link=True, needs_traffic=True,
+        section="sec_run"),
+    Row("history", execute_screens.history_screen, section="sec_run"),
+
+    Row("lang", cycles=True, section="sec_view"),
+    Row("theme", cycles=True, section="sec_view"),
 )
 
 
@@ -103,13 +115,18 @@ def run(version: str = "0.0.0", profile_dir: Path | None = None) -> int:
         return 2
 
     ui.enter_screen()
+    session.start_watch()
     cursor = 0
     crashes = 0
     try:
         while True:
             ui.draw(_render(session, cursor))
-            key = ui.read_key()
-            crashes = 0 if key else crashes
+            # Полсекунды: без таймаута цикл стоит на вводе, и живой индикатор
+            # замирал бы до ближайшего нажатия - выглядя при этом ровно так же
+            # уверенно, как работающий.
+            key = ui.read_key(0.5)
+            if not key:
+                continue
 
             if key in ("q", "quit"):
                 return 0
@@ -128,6 +145,7 @@ def run(version: str = "0.0.0", profile_dir: Path | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
+        session.stop_watch()
         session.disconnect()
         session.save_prefs()
         ui.leave_screen()
@@ -168,6 +186,11 @@ def _render(session: Session, cursor: int) -> str:
     ]
     status, role = session.status_line()
     lines.append(ui.c("  " + status, role))
+    # Живая связь отдельной строкой: та, что выше, говорит, что ответило на
+    # опрос, и остаётся верной до первого изменения снаружи. Эта говорит, здесь
+    # ли машина сейчас.
+    live, live_role = session.link_line()
+    lines.append(ui.c("  " + live, live_role))
     lines.append(ui.c("  " + ui.spread(
         f"{t('profile')}{_profile_line(session)}", "", ui.WIDTH - 2), "dim"))
     last = session.last_run_line()
@@ -175,7 +198,13 @@ def _render(session: Session, cursor: int) -> str:
         lines.append(ui.c(f"  ↻ {t('last_run')}: {ui.trim(last, 44)}", "dim"))
     lines.append("")
 
+    group = ""
     for i, row in enumerate(ROWS):
+        if row.section and row.section != group:
+            if i:
+                lines.append("")
+            lines.append(ui.c("  " + t(row.section), "dim"))
+        group = row.section or group
         lines.append(_row_line(row, session, selected=i == cursor))
 
     lines.append("")
@@ -196,8 +225,11 @@ def _profile_line(session: Session) -> str:
         return t("no_profile")
     profile = session.profile
     enabled = len(profile.enabled_streams)
-    return (f"{profile.name} · {enabled} из {len(profile.streams)} потоков · "
-            f"{profile.total_pps(session.target.link_mbit):,.0f} pps".replace(",", " "))
+    pps = f"{profile.total_pps(session.target.link_mbit):,.0f}".replace(",", " ")
+    # Через словарь, как и всё остальное на этом экране: собранная здесь строка
+    # оставалась русской при английском языке, и шапка выглядела полупереведённой.
+    return t("profile_line", name=profile.name, on=enabled,
+             all=len(profile.streams), pps=pps)
 
 
 def _row_line(row: Row, session: Session, selected: bool) -> str:

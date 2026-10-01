@@ -291,8 +291,18 @@ def packet_fields(stream: Stream) -> list[Field]:
               lambda v: (setattr(stream, "name", v.strip() or stream.name), "")[1]),
         Field("eth_src", t("p_eth_src"), lambda: p.eth_src,
               set_mac("eth_src", t("p_eth_src"))),
+        # Самая дорогая ловушка этого экрана, и стоит она ровно тут. Для
+        # коммутации выдуманный MAC нормален - коробка его выучит. Для
+        # маршрутизации нет: кадр с чужим MAC не поднимется на третий уровень,
+        # приём честно покажет ноль, и это выглядит поломкой инструмента.
         Field("eth_dst", t("p_eth_dst"), lambda: p.eth_dst,
-              set_mac("eth_dst", t("p_eth_dst"))),
+              set_mac("eth_dst", t("p_eth_dst")),
+              hint=lambda: ("маршрутизация: нужен MAC интерфейса роутера - "
+                            "с выдуманным кадр не дойдёт до L3 и приём будет "
+                            "нулевой"
+                            if p.has_ip else
+                            "коммутация: выдуманный годится, коробка его "
+                            "выучит")),
         Field("vlan", t("p_vlan"), lambda: str(p.vlan) if p.has_vlan else t("no"),
               set_vlan, hint="тег добавит 4 байта к кадру"),
         Field("ip_src", t("p_ip_src"), lambda: p.ip_src,
