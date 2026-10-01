@@ -1,0 +1,49 @@
+#!/bin/sh
+# Один вход: поднять окружение и запустить TRaphy.
+#
+#   traphy                         меню
+#   traphy presets                 любая команда — аргументы уходят как есть
+#   traphy run ip_sweep -t bench -d 5
+#
+# Идемпотентно: окружение и установка делаются один раз, дальше сразу запуск.
+# Пароли берутся из файла вне репозитория, если он заведён:
+# ~/.config/traphy/secrets.env (переопределяется через TRAPHY_SECRETS).
+# В сам репозиторий пароли не попадают никогда — он публичный.
+set -eu
+
+# Скрипт зовут по симлинку из ~/.local/bin — корень ищем по реальному пути.
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+root=$(cd "$(dirname "$self")" && pwd)
+venv="$root/.venv"
+stamp="$venv/.installed"
+secrets="${TRAPHY_SECRETS:-$HOME/.config/traphy/secrets.env}"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "нужен python3 — в PATH его нет" >&2
+    exit 1
+fi
+
+if [ ! -x "$venv/bin/python" ]; then
+    echo "· создаю окружение в .venv"
+    python3 -m venv "$venv"
+fi
+
+# Ставим заново только когда pyproject.toml новее отметки об установке.
+if [ ! -f "$stamp" ] || [ "$root/pyproject.toml" -nt "$stamp" ]; then
+    echo "· ставлю traphy и зависимости"
+    "$venv/bin/pip" install -e "$root[ssh,local]" -q --disable-pip-version-check
+    : > "$stamp"
+fi
+
+if [ -f "$secrets" ]; then
+    set -a
+    . "$secrets"
+    set +a
+    # Пустое значение из шаблона не должно выглядеть как заданный пароль:
+    # иначе форма не спросит его, а соединение молча уйдёт без пароля.
+    [ -n "${TRAPHY_SSH_PASSWORD:-}" ] || unset TRAPHY_SSH_PASSWORD
+    [ -n "${TRAPHY_SUDO_PASSWORD:-}" ] || unset TRAPHY_SUDO_PASSWORD
+    [ -n "${TRAPHY_IXIA_PASSWORD:-}" ] || unset TRAPHY_IXIA_PASSWORD
+fi
+
+exec "$venv/bin/traphy" "$@"

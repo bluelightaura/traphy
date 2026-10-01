@@ -1,5 +1,7 @@
 # TRaphy
 
+![TRaphy — builds the frame and blows it down the wire](assets/traphy-banner.png)
+
 *traffic + Scapy*
 
 Каждый раз одно и то же: надо посмотреть, как свитч переживёт перебор IP по
@@ -55,8 +57,34 @@
 
 ## Установка
 
+Один вход - скрипт `start`: он сам создаёт окружение, ставит зависимости и
+запускает. Ставить что-либо руками перед этим не нужно.
+
 ```sh
 git clone https://github.com/bluelightaura/traphy && cd traphy
+./start                     # меню
+./start presets             # любая команда - аргументы уходят как есть
+```
+
+Чтобы звать откуда угодно одной командой, как `code` или `opencode`:
+
+```sh
+ln -s "$PWD/start" ~/.local/bin/traphy
+traphy                      # меню
+traphy run ip_sweep -t bench -d 5
+```
+
+Переустановка происходит сама, когда `pyproject.toml` оказывается новее отметки
+в `.venv`; в остальное время запуск мгновенный.
+
+Пароли `start` подхватывает из `~/.config/traphy/secrets.env`, если файл
+заведён (путь переопределяется через `TRAPHY_SECRETS`) - `TRAPHY_SSH_PASSWORD`,
+`TRAPHY_SUDO_PASSWORD`, `TRAPHY_IXIA_PASSWORD`. В репозиторий они не попадают:
+он публичный, а файл лежит вне него.
+
+Если окружение хочется собрать самому:
+
+```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -e .            # меню, модель и генератор - только стандартная библиотека
 pip install -e '.[ssh]'     # + удалённые цели по SSH
