@@ -38,6 +38,14 @@ class Engine(Protocol):
     can_recover: bool   # whether it can clean up after a run that was killed
     opens_raw_socket: bool  # whether the run itself needs a socket the kernel guards
     rate_hint: str      # the standing note under the rate field
+    # Как этот движок называет происходящее. Шапка и подсказки меню были
+    # написаны под Scapy и оставались такими при выбранном TRex: обещали
+    # «погнать скриптом» там, где скрипт никуда не уезжает, и звали настраивать
+    # «интерфейсы» там, где их нет, а есть индексы портов из trex_cfg.yaml.
+    tagline: str        # подзаголовок главного экрана
+    setup_hint: str     # что на самом деле настраивают в цели
+    prepared_first: bool  # подготовку генератора делают до настройки цели
+    counts_per_group: bool  # считает приём ещё и по группам flow_stats
 
     def generate(self, profile: Profile, tag: str) -> str:
         """The artefact to ship: a script, a plan, a config."""
@@ -143,6 +151,10 @@ class Declared:
     can_recover = False
     opens_raw_socket = False
     rate_hint = ""
+    tagline = "собрать кадр руками - погнать его генератором"
+    setup_hint = "хост, порты, связь"
+    prepared_first = False
+    counts_per_group = False
 
     def _refuse(self) -> EngineNotReady:
         return EngineNotReady(

@@ -283,7 +283,15 @@ class _Live:
         self.session = session
         self.spec = spec
         self.state: dict[str, Any] = {"stage": t("run_building"), "tx": 0,
-                                      "rx": 0, "t": 0.0, "pps": 0.0}
+                                      "rx": 0, "t": 0.0, "pps": 0.0,
+                                      # Приём по своему порту и приём по
+                                      # группам - две разные цифры, и на стенде
+                                      # они расходятся. Показывать одну из них
+                                      # как «принято» значит выбрать за
+                                      # человека, какой верить.
+                                      "rx_port": 0, "rx_groups": 0,
+                                      "link_down": False, "dirty": "",
+                                      "errors": {}}
         self.result: RunResult | None = None
         self.error = ""
         # Сколько кадров скрипт собрал, по его же событию "ready". Для холостого
@@ -298,9 +306,25 @@ class _Live:
         elif kind == "ready":
             self.state["stage"] = t("run_sending")
             self.built = int(event.get("frames", 0) or 0)
+        elif kind == "idle":
+            # Холостой замер до старта: если в сегменте уже летает чужое, об
+            # этом надо знать сейчас, а не разбирать потом цифру в сто
+            # миллионов принятых кадров против четырёх тысяч отправленных.
+            port = int(event.get("rx_port", 0) or 0)
+            groups = int(event.get("rx_groups", 0) or 0)
+            if port or groups:
+                self.state["dirty"] = t("run_dirty", port=f"{port:,}".replace(",", " "),
+                                        groups=f"{groups:,}".replace(",", " "))
         elif kind == "tick":
             self.state.update(tx=event.get("tx", 0), rx=event.get("rx", 0),
-                              t=event.get("t", 0.0), pps=event.get("pps", 0.0))
+                              t=event.get("t", 0.0), pps=event.get("pps", 0.0),
+                              rx_port=event.get("rx_port", 0),
+                              rx_groups=event.get("rx_groups", 0),
+                              link_down=bool(event.get("link_down")))
+        elif kind == "xstats":
+            # Ошибки портов растут молча: без них «потерь нет» и «потери все»
+            # выглядят одинаково уверенно.
+            self.state["errors"] = dict(event.get("grew") or {})
         elif kind == "done":
             self.state["stage"] = t("run_done")
             self.state.update(tx=event.get("tx", 0), rx=event.get("rx", 0))
@@ -367,9 +391,40 @@ class _Live:
             lines.append(_counter(t("l_recv"), ui.c(t("l_unmeasured"), "warn")))
         lines.append(_counter(t("l_rate"), f"{float(s['pps']):,.0f} pps".replace(",", " ")))
 
+        lines += _honesty_rows(session, s)
         lines.append("")
         lines.append(ui.c("  " + t("keys_run"), "dim"))
         return ui.panel(lines, ui.WIDE)
+
+
+def _honesty_rows(session: Session, s: dict[str, Any]) -> list[str]:
+    """Условия замера - рядом с цифрой, а не после прогона.
+
+    Всё здесь появилось из разбора живых прогонов: приём по группам и приём по
+    своему порту расходились на порядки, сегмент оказывался залит кадрами
+    прошлых прогонов ещё до старта, а приёмный тракт терял миллионы кадров сам
+    и не говорил об этом. Цифра без этих условий выглядит как показание
+    прибора, хотя измеряет не то.
+    """
+    engine = engines.get(session.target.engine)
+    if not getattr(engine, "counts_per_group", False):
+        return []
+
+    rows: list[str] = []
+    port, groups = int(s.get("rx_port", 0) or 0), int(s.get("rx_groups", 0) or 0)
+    if port or groups:
+        rows.append("")
+        rows.append(_counter(t("l_rx_port"), f"{port:,}".replace(",", " ")))
+        # Две цифры рядом - это и есть сообщение: когда они расходятся, какой
+        # из них верить, решает человек, а не экран.
+        rows.append(_counter(t("l_rx_groups"), f"{groups:,}".replace(",", " ")))
+    if s.get("link_down"):
+        rows.append(ui.c("  " + t("l_link_down"), "warn"))
+    if s.get("dirty"):
+        rows.append(ui.c("  " + str(s["dirty"]), "warn"))
+    for kind, grew in (s.get("errors") or {}).items():
+        rows.append(ui.c(f"  {kind}: +{int(grew):,}".replace(",", " "), "warn"))
+    return rows
 
 
 def _counter(label: str, value: str) -> str:

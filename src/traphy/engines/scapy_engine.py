@@ -36,6 +36,10 @@ class ScapyEngine:
     can_recover = False
     opens_raw_socket = True
     rate_hint = "это цель, а не гарантия - ядро пасует задолго до карты"
+    tagline = "собрать кадр руками - погнать его скриптом с той машины"
+    setup_hint = "хост, интерфейсы, связь"
+    prepared_first = False
+    counts_per_group = False
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen.generate(profile, tag=tag)

@@ -89,6 +89,10 @@ class IxiaEngine:
     can_recover = False
     opens_raw_socket = False
     rate_hint = "скорость держит шасси - до линейной скорости порта"
+    tagline = "собрать кадр руками - погнать его шасси IxNetwork"
+    setup_hint = "шасси, карты, порты, связь"
+    prepared_first = False
+    counts_per_group = False
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen_ixnet.generate(profile, tag=tag)

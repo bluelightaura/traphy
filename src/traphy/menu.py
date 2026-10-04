@@ -24,6 +24,7 @@ from traphy import strings, ui
 from traphy.screens import compose as compose_screens
 from traphy.screens import connect as connect_screens
 from traphy.screens import execute as execute_screens
+from traphy.screens import provision as provision_screens
 from traphy.session import Session
 from traphy.strings import t
 
@@ -45,6 +46,9 @@ class Row:
     # признака замок был только на связи, и «Запустить» на цели с JMeter
     # сообщал «сначала проверь связь с целью» - про то, что вообще ни при чём.
     needs_engine: bool = False
+    # Подготовка - про DPDK, большие страницы и демона. У Scapy ничего этого
+    # нет, и строка, открывающая пустой экран, хуже отсутствующей.
+    needs_trex: bool = False
     cycles: bool = False            # a preference row, not a screen
     # Заголовок раздела. Печатается перед первой строкой раздела и сам строкой
     # не является: по нему не встать курсором и нечего открыть.
@@ -55,6 +59,22 @@ class Row:
 
     def hint(self) -> str:
         return t(f"{self.key}_hint")
+
+
+def rows_for(session: Session) -> tuple[Row, ...]:
+    """Строки меню в порядке, в котором их делают для этого движка.
+
+    У TRex подготовка генератора идёт прежде настройки цели: номера портов
+    берутся из trex_cfg.yaml, а создаёт его подготовка. Выбирать порт до неё
+    значит выбирать из пустого списка - и именно так это и выглядело.
+    """
+    from traphy import engines
+
+    if not engines.get(session.target.engine).prepared_first:
+        return ROWS
+    order = {"provision": 0, "setup": 1}
+    return tuple(sorted(ROWS, key=lambda r: (ROWS.index(r) if r.key not in order
+                                             else -10 + order[r.key])))
 
 
 def _compose(session: Session) -> None:
@@ -80,6 +100,8 @@ def _save(session: Session) -> None:
 # лежали вперемешку, и по нему не было видно, на каком ты шаге.
 ROWS: tuple[Row, ...] = (
     Row("setup", connect_screens.target_screen, section="sec_gen"),
+    Row("provision", provision_screens.provision_screen, needs_trex=True,
+        section="sec_gen"),
 
     Row("compose", _compose, section="sec_what"),
     Row("streams", compose_screens.streams_screen, needs_traffic=True,
@@ -110,6 +132,8 @@ def _lock(row: Row, session: Session) -> tuple[str, str]:
     «сначала проверь связь с целью» на цели с JMeter посылает проверять то, что
     ни при чём, - и связь при этом может быть прекрасной.
     """
+    if row.needs_trex and session.target.engine != "trex":
+        return t("provision_locked"), "setup"
     if row.needs_engine:
         from traphy import engines
 
@@ -137,7 +161,7 @@ def unlock_row(row: Row, session: Session) -> Row | None:
     looking for a key the screen does not have.
     """
     where = _lock(row, session)[1]
-    return next((r for r in ROWS if r.key == where), None)
+    return next((r for r in rows_for(session) if r.key == where), None)
 
 
 def run(version: str = "0.0.0", profile_dir: Path | None = None) -> int:
@@ -165,15 +189,21 @@ def run(version: str = "0.0.0", profile_dir: Path | None = None) -> int:
             if not key:
                 continue
 
+            # Порядок строк зависит от движка, а движок меняют прямо здесь,
+            # в настройке цели. Поэтому список берётся заново на каждом круге,
+            # а курсор удерживается в его границах.
+            rows = rows_for(session)
+            cursor %= len(rows)
+
             if key in ("q", "quit"):
                 return 0
             if key == "up":
-                cursor = (cursor - 1) % len(ROWS)
+                cursor = (cursor - 1) % len(rows)
             elif key == "down":
-                cursor = (cursor + 1) % len(ROWS)
+                cursor = (cursor + 1) % len(rows)
             elif key in ("enter", "right"):
                 try:
-                    _activate(ROWS[cursor], session)
+                    _activate(rows[cursor], session)
                 except Exception as exc:
                     crashes += 1
                     _crash_panel(exc)
@@ -220,7 +250,7 @@ def _cycle(key: str, session: Session) -> None:
 def _render(session: Session, cursor: int) -> str:
     lines: list[str] = [
         ui.title_row("TRaphy", session.version),
-        ui.c("  " + t("tagline"), "dim"),
+        ui.c("  " + _tagline(session), "dim"),
         None,  # type: ignore[list-item]
         ui.c(ui.spread(f"{t('target')}{session.target.endpoint()}",
                        f"({_engine(session)})", ui.WIDTH), "dim"),
@@ -230,8 +260,16 @@ def _render(session: Session, cursor: int) -> str:
     # Живая связь отдельной строкой: та, что выше, говорит, что ответило на
     # опрос, и остаётся верной до первого изменения снаружи. Эта говорит, здесь
     # ли машина сейчас.
-    live, live_role = session.link_line()
-    lines.append(ui.c("  " + live, live_role))
+    ready, ready_role = _generator_line(session)
+    # Для движка с подготовкой строка про генератор и есть ответ о связи с ним.
+    # Живой индикатор остаётся, только когда ему есть что добавить: на цели с
+    # SSH-переходом он меряет настоящий TCP, а на локальной - говорит, что не
+    # знает, и две строки «не знаю» подряд читаются как сломанный экран.
+    if not (ready and session.watched().is_local):
+        live, live_role = session.link_line()
+        lines.append(ui.c("  " + live, live_role))
+    if ready:
+        lines.append(ui.c("  " + ready, ready_role))
     lines.append(ui.c("  " + ui.spread(
         f"{t('profile')}{_profile_line(session)}", "", ui.WIDTH - 2), "dim"))
     last = session.last_run_line()
@@ -240,7 +278,7 @@ def _render(session: Session, cursor: int) -> str:
     lines.append("")
 
     group = ""
-    for i, row in enumerate(ROWS):
+    for i, row in enumerate(rows_for(session)):
         if row.section and row.section != group:
             if i:
                 lines.append("")
@@ -251,6 +289,50 @@ def _render(session: Session, cursor: int) -> str:
     lines.append("")
     lines.extend(ui.hint_rows(t("keys_main"), ui.WIDTH))
     return ui.panel(lines, ui.WIDTH)
+
+
+def _generator_line(session: Session) -> tuple[str, str]:
+    """Готов ли генератор к прогону - для движков, которым его готовят.
+
+    Прежде здесь стояла строка «связь до генератора проверяет опрос цели»,
+    верная и бесполезная: она ничего не говорила о том, поднят ли демон и
+    отданы ли карты DPDK, а прогон упирается именно в это.
+    """
+    from traphy import engines
+
+    if not engines.get(session.target.engine).prepared_first:
+        return "", "dim"
+    gen = session.generator
+    if gen is None:
+        return "◇ генератор не опрашивался - «Подготовить генератор»", "dim"
+    if not getattr(gen, "ok", False):
+        return f"✗ генератор: {getattr(gen, 'error', 'не ответил')}", "warn"
+
+    bound = [n for n in gen.nics if n.on_dpdk]
+    # Про страницы говорим только когда их нет: строка в шапке короткая, и
+    # место в ней достаётся тому, что мешает, а не тому, что в порядке.
+    bits = [f"портов DPDK: {len(bound)}"]
+    if not gen.hugepages_total:
+        bits.append("страниц нет")
+    bits.append("демон отвечает" if gen.daemon_running else "демон не поднят")
+    role = "ok" if (gen.daemon_running and bound and gen.hugepages_total) else "warn"
+    mark = "●" if role == "ok" else "○"
+
+    # Версия - приятно, но не она мешает прогону. Если строка не помещается,
+    # обрезать надо её, а не то, что сломано.
+    limit = ui.WIDTH - 4
+    full = f"{mark} TRex {gen.trex_version} · {' · '.join(bits)}" \
+        if gen.trex_version else f"{mark} {' · '.join(bits)}"
+    if ui.width_of(full) > limit:
+        full = f"{mark} {' · '.join(bits)}"
+    return ui.trim(full, limit), role
+
+
+def _tagline(session: Session) -> str:
+    """Чем тут занимаются - словами выбранного движка, а не вообще."""
+    from traphy import engines
+
+    return engines.get(session.target.engine).tagline
 
 
 def _engine(session: Session) -> str:
@@ -286,6 +368,13 @@ def _row_line(row: Row, session: Session, selected: bool) -> str:
     reason = "" if row.cycles else locked_reason(row, session)
     label = row.title()
     hint = row.hint()
+
+    if row.key == "setup":
+        # «хост, интерфейсы, связь» верно только для Scapy: у TRex нет
+        # интерфейсов, есть индексы портов из trex_cfg.yaml.
+        from traphy import engines
+
+        hint = engines.get(session.target.engine).setup_hint
 
     if row.key == "lang":
         hint = ui.c(strings.lang().upper(), "title")

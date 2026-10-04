@@ -79,6 +79,15 @@ class TrexEngine:
     can_recover = True
     opens_raw_socket = False
     rate_hint = "скорость держит карта - до линейной скорости порта"
+    tagline = "собрать кадр руками - гнать картой на линейной скорости"
+    setup_hint = "генератор, порты DPDK, связь"
+    # Номера портов берутся из trex_cfg.yaml, а его создаёт подготовка:
+    # настраивать цель до неё значит выбирать из пустого списка.
+    prepared_first = True
+    # Считает приём и по своему порту, и по группам flow_stats. Цифры
+    # расходятся, и обе надо показывать: на части карт счёт по группам не
+    # ведётся вовсе, и ноль в них - свойство карты, а не потеря.
+    counts_per_group = True
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen_stl.generate(profile, tag=tag)
