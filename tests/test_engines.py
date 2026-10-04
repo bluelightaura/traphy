@@ -138,3 +138,28 @@ def test_both_engines_ship_frames_home_the_same_way():
         compile(source, module.__name__, "exec")
         assert "def ship_pcap(" in source
         assert source.count("CHUNK = 48000") == 1
+
+
+def test_every_engine_answers_what_the_screens_ask_of_it():
+    """Экраны спрашивают подсказку, пояснение и предупреждения у выбранного
+    движка, а не у Scapy. Движок, забывший одно из этого, валит не свой тест, а
+    экран - и обычно на цели, которую собирают первый раз в жизни."""
+    from traphy.models import FieldTarget, VMField
+
+    profile = presets.build("l3_ip")
+    stream = profile.streams[0]
+    vf = VMField(target=FieldTarget.IP_DST, min_value="10.0.0.1",
+                 max_value="10.0.0.9")
+    host = HostInfo(ok=True, ifaces=[Iface("ens1", state="up")])
+
+    for key, engine in engines.REGISTRY.items():
+        assert engine.script_name(profile).endswith(engine.file_suffix), key
+        assert isinstance(engine.rate_hint, str), key
+        assert isinstance(engine.rate_note(stream, 25000), str), key
+        assert isinstance(engine.range_note(vf), str), key
+        assert isinstance(engine.describe_host(host), str), key
+        assert isinstance(engine.warnings(profile), list), key
+
+    raw = [key for key, engine in engines.REGISTRY.items()
+           if engine.opens_raw_socket]
+    assert raw == ["scapy"], "сырой сокет открывает только Scapy"

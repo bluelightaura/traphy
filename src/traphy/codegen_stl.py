@@ -32,6 +32,7 @@ knowing which one produced it.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 
 from traphy import codegen_ship
@@ -64,9 +65,49 @@ def generate(profile: Profile, tag: str = "") -> str:
     enabled = profile.enabled_streams
     skipped = [s.name for s in profile.streams if not s.enabled]
 
+    counted = len([s for s in enabled if s.packet.has_ip])
     parts = [_header(profile, skipped, tag, enabled), _HELPERS,
-             codegen_ship.SHIP, _builder(enabled), _ENGINE]
+             codegen_ship.SHIP, _builder(enabled, _pg_base(tag, counted)),
+             _ENGINE]
     return "\n\n".join(parts) + "\n"
+
+
+def ordered_frames(profile: Profile) -> int:
+    """How many frames this profile commits to sending, or 0 when it does not.
+
+    Конечный план есть только у очередей: там число кадров названо заранее, и
+    факт можно сверить с ним строго. У continuous плана нет по устройству
+    режима - он льёт, пока его не остановят, - поэтому один такой поток делает
+    бесплановым весь прогон. Врать тут нельзя в обе стороны: выдуманный план
+    отменял бы годные замеры, отсутствие плана оставляет недоотправку
+    незамеченной.
+    """
+    frames = 0
+    for s in profile.enabled_streams:
+        if s.tx_mode is TxMode.CONTINUOUS:
+            return 0
+        bursts = s.number_of_bursts if s.tx_mode is TxMode.MULTI_BURST else 1
+        frames += max(0, s.pkts_per_burst) * max(1, bursts)
+    return frames
+
+
+def _pg_base(tag: str, counted: int) -> int:
+    """Where this run's hardware counter groups start.
+
+    The first group used to be zero every single run, and that is the one place
+    repeatability does harm. A frame carries the group number and nothing about
+    which run put it there, so a previous run's tail still circulating in the
+    segment is counted by the current one as its own. On the bench that turned
+    4001 sent frames into 142 250 747 "received" - and the run before it, with
+    the groups blind, showed zero. Same cause, opposite symptom.
+
+    Это не защита от чужого инструмента: он может взять ту же группу. От чужого
+    защищает холостой замер перед стартом - см. ``idle_check``.
+    """
+    room = MAX_PG_ID - max(1, counted)
+    if room <= 0 or not tag:
+        return 0
+    return int(hashlib.sha256(tag.encode("utf-8")).hexdigest()[:8], 16) % room
 
 
 def frame_count(profile: Profile) -> int:
@@ -130,6 +171,7 @@ def _header(profile: Profile, skipped: list[str], tag: str,
     paths = ", ".join(repr(p) for p in STL_PATHS)
     walk = {s.name: _stream_frames(s) for s in enabled}
     said = warnings(profile)
+    ordered = ordered_frames(profile)
     return f'''\
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------
@@ -171,7 +213,14 @@ VM_FRAMES = {walk!r}
 
 # То, что этот профиль теряет именно на TRex. Список собран при генерации и
 # лежит прямо здесь, чтобы сохранённый скрипт говорил это сам, без TRaphy.
-WARNINGS = {said!r}'''
+WARNINGS = {said!r}
+
+# Сколько кадров профиль обещает послать: 0 - плана нет, прогон по времени.
+ORDERED = {ordered}
+
+# Метка прогона. Раньше жила только в комментарии выше - а она нужна коду: по
+# ней след аренды опознаёт, чей это прогон.
+RUN_TAG = {tag!r}'''
 
 
 # --------------------------------------------------------------------------- #
@@ -282,6 +331,25 @@ def total(value):
     return int(value or 0)
 
 
+def per_port(value, port):
+    """Группа считает по портам; нас интересует тот, который обязан принять.
+
+    Возвращает (цифра по порту, есть ли вообще запись по нему).
+
+    Агрегат ``total`` складывает все порты шасси. Кадр нашей группы, пришедший
+    не на тот порт, где мы его ждём, в агрегате выглядит как наш принятый - а
+    это вопрос к схеме стенда, не к устройству под нагрузкой. И отсутствие
+    записи по нужному порту - это не ноль принятых: это «счётчика нет», и
+    подменять его суммой по всем портам нельзя.
+    """
+    if not isinstance(value, dict) or port < 0:
+        return 0, False
+    for key in (port, str(port)):
+        if key in value:
+            return int(value[key] or 0), True
+    return 0, False
+
+
 def write_pcap(path, frames):
     """Write one sample frame per stream - what we built, before the engine.
 
@@ -296,7 +364,7 @@ def write_pcap(path, frames):
 # --------------------------------------------------------------------------- #
 # The generated builder
 # --------------------------------------------------------------------------- #
-def _builder(streams: list[Stream]) -> str:
+def _builder(streams: list[Stream], pg_base: int = 0) -> str:
     """Emit ``build_streams()``: the profile in TRex's own vocabulary."""
     body = [
         "def build_streams(api, L, want_flow_stats):",
@@ -310,7 +378,7 @@ def _builder(streams: list[Stream]) -> str:
         "    frames = []",
         "    pg_ids = []",
         "    uncounted = []",
-        "    pg_next = 0",
+        f"    pg_next = {pg_base}",
     ]
     for s in streams:
         body.append("")
@@ -489,12 +557,388 @@ SOURCE_NOTES = {
     "flow_stats_unverified": "группы потока на приёме показали ноль, а "
                              "счётчик порта приёма не прочитался - сверить "
                              "было нечем, поэтому ноль подаётся как неточный",
+    "flow_stats_foreign": "в нашу группу попали кадры, пришедшие не на тот "
+                          "порт, который по схеме обязан принимать - цифра "
+                          "приёма описывает не наш путь. Смотреть надо схему "
+                          "стенда и изоляцию сегмента",
+    "flow_stats_noport": "у группы нет разбивки по нашему порту приёма - "
+                         "счётчика нет, и это не то же самое, что ноль "
+                         "принятых; цифра взята по всем портам сразу",
+    "flow_stats_tainted": "в наши группы на приёме уже шли кадры, когда мы "
+                          "ещё ничего не отправляли, - значит в счёт попало не "
+                          "только наше. Аппаратный счёт тут не считается "
+                          "надёжным, сколько бы ровно он ни выглядел",
     "none": "приём не измерялся - без --rx-port считать нечем",
 }
 
 
 class Busy(Exception):
     """The ports belong to somebody else and we were not told to take them."""
+
+
+class Dirty(Exception):
+    """The ports are ours now, but somebody left them in a working state."""
+
+
+def service_is_on(client, port):
+    """Стоит ли порт в сервисном режиме. None - узнать не удалось.
+
+    Разные релизы отдают атрибуты порта по-разному, а гадать тут нельзя в обе
+    стороны: соврать «режим выключен» значит пропустить остаток, соврать
+    «включён» значит отказать на чистой машине. Поэтому «не знаю» - отдельный
+    ответ, и он никого ни в чём не обвиняет.
+    """
+    getter = getattr(client, "get_port_attr", None)
+    if getter is None:
+        return None
+    try:
+        attr = getter(port)
+    except Exception:
+        return None
+    if not isinstance(attr, dict):
+        return None
+    for key in ("service", "service_mode", "is_service_mode"):
+        if key in attr:
+            value = attr[key]
+            if isinstance(value, str):
+                return value.strip().lower() in ("on", "true", "yes", "1")
+            return bool(value)
+    return None
+
+
+def live_captures(client):
+    """Сколько записей висит на демоне. None - узнать не удалось."""
+    for name in ("get_capture_status", "capture_status"):
+        getter = getattr(client, name, None)
+        if getter is None:
+            continue
+        try:
+            status = getter()
+        except Exception:
+            return None
+        if isinstance(status, dict):
+            return len(status)
+        if isinstance(status, (list, tuple)):
+            return len(status)
+    return None
+
+
+# Имена счётчиков ошибок приходят от драйвера, и одно и то же зовётся у разных
+# карт по-разному. Поэтому разбор по подстрокам, а незнакомое имя называется
+# незнакомым: приговор остаётся за человеком, программа говорит, что это и куда
+# смотреть. Соврать здесь дороже, чем промолчать.
+#
+# Деление важнее самих имён. Счётчик генератора означает, что кадры потерялись
+# НА НАШЕЙ стороне, не дойдя до устройства, - потери такого прогона считать
+# нельзя вообще. Счётчик линка означает кабель, оптику или согласование, и это
+# тоже не про устройство под нагрузкой.
+ERR_GENERATOR = ("missed", "no_buffer", "nombuf", "mbuf", "alloc",
+                 "out_of_buffer", "no_dma")
+ERR_LINK = ("crc", "phy", "symbol", "illegal", "oversize", "undersize",
+            "fragment", "jabber", "align")
+ERR_MARKS = ERR_GENERATOR + ERR_LINK + ("err", "drop", "discard")
+
+
+def error_kind(name):
+    """generator | link | unknown - по имени счётчика, как его зовёт драйвер."""
+    low = name.lower()
+    for mark in ERR_GENERATOR:
+        if mark in low:
+            return "generator"
+    for mark in ERR_LINK:
+        if mark in low:
+            return "link"
+    return "unknown"
+
+
+def read_xstats(client, ports):
+    """Счётчики ошибок портов. Пусто, если релиз их не отдаёт.
+
+    Берутся только те, в чьём имени есть признак ошибки: среди xstats полно
+    обычных счётчиков кадров, и они растут на любом прогоне - мешать их с
+    ошибками значит утопить находку в шуме.
+    """
+    getter = getattr(client, "get_xstats", None)
+    if getter is None:
+        return {}
+    out = {}
+    for port in ports:
+        try:
+            stats = getter(port)
+        except Exception:
+            continue
+        if not isinstance(stats, dict):
+            continue
+        for name, value in stats.items():
+            low = str(name).lower()
+            if not any(mark in low for mark in ERR_MARKS):
+                continue
+            try:
+                out["%d:%s" % (port, name)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def grown_errors(before, after):
+    """Что выросло за прогон, с разбором по виду. Только прирост, не абсолют."""
+    grew = {}
+    kinds = {}
+    for name, value in (after or {}).items():
+        delta = value - (before or {}).get(name, 0)
+        if delta > 0:
+            grew[name] = delta
+            kinds[name] = error_kind(name.split(":", 1)[-1])
+    return grew, kinds
+
+
+# --------------------------------------------------------------------------- #
+# След аренды: чем прогон говорит следующему, что порты заняты им
+# --------------------------------------------------------------------------- #
+LEASE_DIR = "/tmp/traphy"
+
+
+def lease_path(args, ports):
+    """Один файл на набор портов - ресурс именно они, а не прогон.
+
+    Каталог задаётся снаружи: на машине-генераторе он общий для всех, кто с неё
+    работает, и подменить его нужно и в тестах, и там, где /tmp чистят по
+    расписанию - след, исчезнувший сам, оставит порты без владельца.
+    """
+    return os.path.join(getattr(args, "lease_dir", "") or LEASE_DIR,
+                        "lease-%s.json" % "-".join(str(p) for p in sorted(ports)))
+
+
+def process_identity(pid=None):
+    """Чем этот процесс отличается от другого с тем же номером.
+
+    Номер pid переиспользуется, поэтому «процесс 1234 жив» само по себе не
+    значит ничего: это может быть уже другой процесс. К номеру добавляются
+    идентификатор загрузки системы и момент старта процесса в тиках - вместе они
+    опознают именно тот процесс, который брал порты, и только его.
+    """
+    pid = os.getpid() if pid is None else pid
+    boot = ""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            boot = fh.read().strip()
+    except OSError:
+        pass
+    started = ""
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            # Поле 22 - момент старта процесса. Имя процесса в скобках может
+            # содержать пробелы, поэтому отсчёт идёт от закрывающей скобки.
+            fields = fh.read().rsplit(") ", 1)[-1].split()
+        started = fields[19]
+    except (OSError, IndexError):
+        pass
+    return {"pid": pid, "boot": boot, "started": started}
+
+
+def owner_alive(who):
+    """Жив ли тот самый процесс, который взял порты. None - не определить."""
+    now = process_identity(who.get("pid") or 0)
+    if who.get("boot") and now["boot"] and who["boot"] != now["boot"]:
+        return False                  # машина перезагружалась - процесса нет
+    try:
+        os.kill(int(who.get("pid") or 0), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                   # чужой процесс, но он есть
+    except (OSError, ValueError):
+        return None
+    if who.get("started") and now["started"] and who["started"] != now["started"]:
+        return False                  # номер переиспользован другим процессом
+    return True
+
+
+def write_lease(args, ports, pg_ids, quiet):
+    """Оставить след: кто держит эти порты и чем его опознать.
+
+    Нужен ровно для одного - чтобы за прогоном, убитым сигналом, можно было
+    убрать. Его ``finally`` не исполняется вовсе, и без следа следующий человек
+    видит порты, занятые неизвестно кем, и машину в состоянии, которого он не
+    делал.
+    """
+    path = lease_path(args, ports)
+    data = dict(process_identity(), ports=list(ports), pg_ids=list(pg_ids),
+                tag=RUN_TAG, at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        emit(quiet, ev="note",
+             msg="след аренды не записался (%s) - убрать за этим прогоном "
+                 "автоматически будет нечем" % exc)
+        return None
+    return path
+
+
+def update_lease(path, **fields):
+    """Дописать в след то, что выяснилось позже: что мы переключили на портах.
+
+    След пишется сразу после захвата, чтобы он существовал как можно раньше, -
+    а сервисный режим и promiscuous меняются после. Без этого шага уборка знала
+    бы, какие порты занять, но не знала бы, в какое состояние их вернуть.
+    """
+    if not path:
+        return
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        data.update(fields)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+    except (OSError, ValueError):
+        pass
+
+
+def drop_lease(path):
+    """Убрать след за собой. Молча: прогон уже кончился, добавить нечего."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def port_flag(client, port, *names):
+    """Значение флага порта по любому из его имён. None - не узнать."""
+    getter = getattr(client, "get_port_attr", None)
+    if getter is None:
+        return None
+    try:
+        attr = getter(port)
+    except Exception:
+        return None
+    if not isinstance(attr, dict):
+        return None
+    for name in names:
+        if attr.get(name) is not None:
+            value = attr[name]
+            if isinstance(value, str):
+                return value.strip().lower() in ("on", "true", "yes", "1")
+            return bool(value)
+    return None
+
+
+def take_promiscuous(client, args, quiet):
+    """Включить promiscuous на порту приёма, запомнив, как было.
+
+    Карта с выключенным promiscuous отбрасывает кадры с чужим MAC, и приём
+    читается нулём при исправном линке и идущем трафике. Пресеты шлют с
+    выдуманными адресами - для коммутации это нормально и даже правильно, - но
+    принимающий порт обязан их пропустить, иначе ноль в колонке приёма описывает
+    фильтр карты, а выглядит как потери на устройстве.
+
+    Возвращает (порт, как было) либо None, когда менять нечего. Включать молча
+    нельзя: это изменение состояния чужой машины, и вернуть его обязаны мы.
+    """
+    if args.rx_port < 0 or not args.promiscuous:
+        return None
+    setter = getattr(client, "set_port_attr", None)
+    if setter is None:
+        return None
+    was = port_flag(client, args.rx_port, "prom", "promiscuous")
+    if was is True:
+        return None                      # уже включён - трогать нечего
+    try:
+        setter(ports=[args.rx_port], promiscuous=True)
+    except Exception as exc:
+        emit(quiet, ev="note",
+             msg="promiscuous на порту %d включить не удалось (%s) - если приём "
+                 "окажется нулевым при идущем трафике, подозревать надо фильтр "
+                 "карты, а не устройство" % (args.rx_port, exc))
+        return None
+    emit(quiet, ev="note",
+         msg="promiscuous на порту %d включён на время прогона - кадры с "
+             "выдуманными MAC иначе отбрасывает сама карта" % args.rx_port)
+    return (args.rx_port, bool(was))
+
+
+def link_is_down(client, ports):
+    """Упал ли линк на наших портах. None - узнать не удалось.
+
+    Линк, упавший ПОСРЕДИ прогона, не ловится больше ничем: до старта TRex сам
+    откажется стартовать на упавшем порту, а дальше тишина в кабеле выглядит
+    ровно как потери на устройстве. Поэтому его состояние спрашивается в каждом
+    тике, и один упавший порт отменяет замер целиком.
+    """
+    getter = getattr(client, "get_port_attr", None)
+    if getter is None:
+        return None
+    seen = False
+    for port in ports:
+        try:
+            attr = getter(port)
+        except Exception:
+            continue
+        if not isinstance(attr, dict) or attr.get("link") is None:
+            continue
+        seen = True
+        if str(attr["link"]).strip().upper().startswith("DOWN"):
+            return True
+    return False if seen else None
+
+
+def leftovers(client, ports):
+    """What somebody left behind on ports that are now ours.
+
+    Проверяется ПОСЛЕ захвата и ДО любого изменения состояния - это
+    единственное место, где виден остаток прогона, убитого сигналом: его
+    ``finally`` не исполнялся вовсе, поэтому на машине остаются идущий трафик,
+    включённый сервисный режим и живая запись. Следующий человек получает
+    отказ, к его работе отношения не имеющий, и связать его с записью,
+    снятой часами раньше, не может никто.
+
+    Отдельно важен идущий трафик: continuous-поток мёртвого владельца льёт
+    кадры в порт приёма и попадает в наш групповой счёт - ровно это и дало на
+    стенде 142 млн «принятых» при четырёх тысячах отправленных.
+    """
+    found = []
+    try:
+        if client.is_traffic_active(ports=ports):
+            found.append("на портах идёт трафик - либо чужой, либо оставшийся "
+                         "после прогона, который не убрал за собой")
+    except Exception:
+        pass
+    for port in ports:
+        if service_is_on(client, port) is True:
+            found.append("порт %d стоит в сервисном режиме - его оставили "
+                         "включённым, и потолок скорости на нём занижен"
+                         % port)
+    live = live_captures(client)
+    if live:
+        found.append("на демоне висит записей: %d - пока они живы, сервисный "
+                     "режим не выключается" % live)
+    return found
+
+
+def clear_leftovers(client, ports, found, quiet):
+    """Убрать остаток - только когда оператор сказал это вслух."""
+    emit(quiet, ev="note",
+         msg="--force: убираю остаток перед прогоном (%s)" % "; ".join(found))
+    try:
+        client.stop(ports=ports)
+    except Exception:
+        pass
+    for name in ("remove_all_captures", "clear_captures"):
+        killer = getattr(client, name, None)
+        if killer is not None:
+            try:
+                killer()
+            except Exception:
+                pass
+            break
+    try:
+        client.set_service_mode(ports=ports, enabled=False)
+    except Exception:
+        pass
 
 
 def take_ports(client, args, ports, quiet):
@@ -516,43 +960,111 @@ def take_ports(client, args, ports, quiet):
         raise Busy("порты %s не отдаются: %s. Генератор общий - выясни, чей "
                    "прогон идёт, либо задай --force, чтобы отобрать"
                    % (", ".join(str(p) for p in ports), exc))
-    if args.force and client.is_traffic_active(ports=ports):
-        emit(quiet, ev="note",
-             msg="порты отобраны с --force, и на них шёл трафик - он остановлен")
-        client.stop(ports=ports)
+    # Порты наши - и прежде чем что-либо на них менять, надо посмотреть, в
+    # каком виде их оставили. Отказ здесь дешевле замера, который потом никто
+    # не сможет объяснить.
+    found = leftovers(client, ports)
+    if found and not args.force:
+        raise Dirty("порты %s захвачены, но на них остался чужой след: %s. "
+                    "Разберись, чей это прогон, либо задай --force - тогда "
+                    "остаток будет убран и об этом будет сказано"
+                    % (", ".join(str(p) for p in ports), "; ".join(found)))
+    if found:
+        clear_leftovers(client, ports, found, quiet)
     client.remove_all_streams(ports=ports)
     client.clear_stats()
 
 
-def sample(client, args, pg_ids, counted_all):
-    """One reading of the counters, and where each number came from."""
+def absolutes(client, args, pg_ids):
+    """Счётчики как есть, ничего не вычитая - сырьё и для базы, и для замера.
+
+    Отдельно от sample() ровно потому, что одни и те же цифры нужны в двух
+    качествах: как опорная точка перед стартом и как показания по ходу. Читать
+    их двумя разными кусками кода - значит однажды сравнить несравнимое.
+    """
     stats = client.get_stats()
     port = port_stats(stats, args.tx_port) or {}
-    out = {
+    rx_entry = port_stats(stats, args.rx_port)
+    groups = stats.get("flow_stats") or {}
+    seen = [groups[pg] for pg in pg_ids if pg in groups]
+    return {
         "tx": int(port.get("opackets", 0) or 0),
         "tx_bytes": int(port.get("obytes", 0) or 0),
         "tx_pps": float(port.get("tx_pps", 0.0) or 0.0),
+        "rx_port": int((rx_entry or {}).get("ipackets", 0) or 0),
+        "rx_port_seen": rx_entry is not None,
+        "group_tx": sum(total(g.get("tx_pkts")) for g in seen),
+        "group_rx": sum(total(g.get("rx_pkts")) for g in seen),
+        "group_rx_port": sum(per_port(g.get("rx_pkts"), args.rx_port)[0]
+                             for g in seen),
+        # Есть ли разбивка по нужному порту хотя бы у одной группы. Нет - это
+        # отдельный ответ, а не ноль принятых.
+        "group_rx_port_seen": any(per_port(g.get("rx_pkts"), args.rx_port)[1]
+                                  for g in seen),
+        "groups": len(seen),
+    }
+
+
+def ZERO_BASE():
+    """Опорная точка, когда её не брали: вычитать нечего."""
+    return {"tx": 0, "tx_bytes": 0, "rx_port": 0, "group_tx": 0,
+            "group_rx": 0, "group_rx_port": 0}
+
+
+def sample(client, args, pg_ids, counted_all, base=None):
+    """One reading of the counters, and where each number came from.
+
+    Всё считается РАЗНИЦЕЙ к опорной точке, снятой перед стартом. Абсолютные
+    значения тут не годятся: демон живёт неделями, группу с тем же номером мог
+    использовать прошлый прогон, и обнуление счётчиков до регистрации наших
+    потоков наших групп не касается вовсе. Прочитанный абсолют выглядит как
+    показание прибора - на стенде это дало 142 млн «принятых» при четырёх
+    тысячах отправленных.
+    """
+    base = base or ZERO_BASE()
+    raw = absolutes(client, args, pg_ids)
+    out = {
+        "tx": max(0, raw["tx"] - base["tx"]),
+        "tx_bytes": max(0, raw["tx_bytes"] - base["tx_bytes"]),
+        "tx_pps": raw["tx_pps"],
         "rx": 0,
+        "rx_port": 0,
+        "rx_groups": 0,
+        "rx_foreign": 0,
         "source": "none",
     }
     # The receiving port's own counter, read whether or not flow stats are in
     # play. It is the only thing that can contradict a zero from the groups,
     # and a zero that nothing can contradict is how a working link gets
     # reported as a dead one.
-    rx_entry = port_stats(stats, args.rx_port)
-    port_rx = int((rx_entry or {}).get("ipackets", 0) or 0)
+    rx_entry = raw["rx_port_seen"]
+    port_rx = max(0, raw["rx_port"] - base["rx_port"])
+    out["rx_port"] = port_rx
 
-    groups = stats.get("flow_stats") or {}
-    seen = [groups[pg] for pg in pg_ids if pg in groups]
-    if seen:
-        group_rx = sum(total(g.get("rx_pkts")) for g in seen)
+    if raw["groups"]:
+        group_all = max(0, raw["group_rx"] - base["group_rx"])
+        group_rx = max(0, raw["group_rx_port"] - base["group_rx_port"])
+        if not raw["group_rx_port_seen"]:
+            # Разбивки по нашему порту нет вовсе. Это не ноль - это отсутствие
+            # счётчика, и единственный честный ход тут назвать его так.
+            group_rx = group_all
         out["rx"] = group_rx
+        out["rx_groups"] = group_rx
+        out["rx_foreign"] = max(0, group_all - group_rx)
         if counted_all:
             # Per-group counters in hardware on both sides. This is the one
             # reading here that goes into a report without a caveat - but only
             # while it is not being contradicted.
-            out["tx"] = sum(total(g.get("tx_pkts")) for g in seen) or out["tx"]
+            group_tx = max(0, raw["group_tx"] - base["group_tx"])
+            out["tx"] = group_tx or out["tx"]
             out["source"] = "flow_stats"
+            if not raw["group_rx_port_seen"]:
+                out["source"] = "flow_stats_noport"
+            elif out["rx_foreign"]:
+                # Кадры с нашей меткой группы пришли не на тот порт, который по
+                # схеме обязан принимать. Сложить их с нашими - значит выдать
+                # чужой путь за наш; это вопрос к схеме стенда.
+                out["source"] = "flow_stats_foreign"
         else:
             out["source"] = "mixed"
         # The contradiction that matters: the groups counted nothing on the
@@ -564,7 +1076,7 @@ def sample(client, args, pg_ids, counted_all):
         if group_rx == 0 and port_rx > 0:
             out["rx"] = port_rx
             out["source"] = "flow_stats_blind"
-        elif group_rx == 0 and rx_entry is None and args.rx_port >= 0:
+        elif group_rx == 0 and not rx_entry and args.rx_port >= 0:
             # A zero nothing was able to contradict. It may well be the truth,
             # but it is exactly the shape a blind driver produces, and the one
             # reading that would have told them apart is missing. Saying so
@@ -577,7 +1089,44 @@ def sample(client, args, pg_ids, counted_all):
     return out
 
 
-def start_capture(client, args, quiet):
+def idle_check(client, args, pg_ids, base, quiet):
+    """Read the receive side while this run is deliberately sending nothing.
+
+    Счётчики только что обнулены, потоки ещё не стартовали. Всё, что прибавится
+    за эту паузу, пришло не от нас - и узнать это ДО замера дороже, чем после:
+    иначе грязный сегмент выглядит как показания прибора. На стенде именно это и
+    случилось - в порт приёма шло 33 млн кадров в секунду, и аппаратный счёт
+    отдал 142 млн при четырёх тысячах отправленных.
+
+    Группы важнее порта. В порт может лететь что угодно, это нормально и лишь
+    делает счётчик порта приблизительным. А вот кадры, попадающие в НАШУ группу,
+    отравляют единственную цифру, которой инструмент верит без оговорок.
+    """
+    if args.idle_check <= 0 or args.rx_port < 0:
+        return None
+    time.sleep(args.idle_check)
+    now = absolutes(client, args, pg_ids)
+    port_rx = max(0, now["rx_port"] - base["rx_port"])
+    group_rx = max(0, now["group_rx_port"] - base["group_rx_port"])
+    if not now["group_rx_port_seen"]:
+        group_rx = max(0, now["group_rx"] - base["group_rx"])
+    emit(quiet, ev="idle", seconds=args.idle_check, rx_port=port_rx,
+         rx_groups=group_rx, pg_ids=list(pg_ids))
+    if group_rx:
+        emit(quiet, ev="note",
+             msg="до старта в наши группы приёма легло %d кадров за %.1f c - "
+                 "сегмент занят чужим трафиком с той же меткой группы; "
+                 "аппаратный счёт по этому прогону доверия не заслуживает"
+                 % (group_rx, args.idle_check))
+    elif port_rx:
+        emit(quiet, ev="note",
+             msg="до старта в порт приёма легло %d кадров за %.1f c - в "
+                 "сегменте идёт посторонний трафик; счёт по счётчику порта "
+                 "в этом прогоне ничего не измерит" % (port_rx, args.idle_check))
+    return {"rx_port": port_rx, "rx_groups": group_rx}
+
+
+def start_capture(client, args, quiet, service_ports):
     """Begin recording both directions. Returns the handles, or None.
 
     Automatic rather than asked for. A run whose frames were not kept can
@@ -602,6 +1151,7 @@ def start_capture(client, args, quiet):
         # result says the run was recorded instead of leaving the operator to
         # discover the ceiling and blame the device for it.
         client.set_service_mode(ports=ports, enabled=True)
+        service_ports.extend(ports)
         for kind, port in (("tx", args.tx_port), ("rx", args.rx_port)):
             if port < 0:
                 continue
@@ -613,6 +1163,8 @@ def start_capture(client, args, quiet):
              msg="захват не начался (%s) - прогон идёт без записи кадров" % exc)
         try:
             client.set_service_mode(ports=ports, enabled=False)
+            while service_ports:
+                service_ports.pop()
         except Exception:
             pass
         return None
@@ -665,6 +1217,106 @@ def stop_capture(client, args, handles, quiet):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def recover(api, args, quiet):
+    """Убрать за прогоном, который не убрал за собой.
+
+    Это НЕ силовой захват вслепую. Силовой захват здесь всё равно происходит -
+    ключей владения, выданных демоном, у нас нет и достать их из клиента нечем, -
+    но он разрешён только после того, как по следу аренды доказано, что процесс
+    владельца мёртв. Живой прогон не трогается: отобрать у живого - это --force,
+    и это другое решение, которое принимает человек.
+
+    И главное, что говорится в конце: освобождены ресурсы, а измерение НЕ
+    восстановлено. Прогон, который тут убирали, не состоялся.
+    """
+    ports = [args.tx_port]
+    if args.rx_port >= 0 and args.rx_port != args.tx_port:
+        ports.append(args.rx_port)
+    path = lease_path(args, ports)
+    try:
+        with open(path) as fh:
+            lease = json.load(fh)
+    except (OSError, ValueError) as exc:
+        msg = ("следа аренды на портах %s нет (%s) - убирать нечего. Либо за "
+               "этими портами никто не падал, либо прогон шёл с другими "
+               "портами или с другой машины"
+               % (", ".join(str(p) for p in ports), exc))
+        emit(quiet, ev="error", msg=msg)
+        print(msg, file=sys.stderr)
+        return 2
+
+    alive = owner_alive(lease)
+    if alive is not False:
+        why = ("ещё жив" if alive else "жив он или нет - определить не удалось")
+        msg = ("прогон с меткой %s (pid %s) %s - уборка отменена. Дождись его "
+               "или останови сам; отобрать у живого прогона - это --force, и "
+               "это другое решение"
+               % (lease.get("tag", "?"), lease.get("pid"), why))
+        emit(quiet, ev="error", msg=msg)
+        print(msg, file=sys.stderr)
+        return 4
+
+    emit(quiet, ev="note",
+         msg="след аренды от %s (метка %s, pid %s): процесс мёртв, убираю"
+             % (lease.get("at", "?"), lease.get("tag", "?"), lease.get("pid")))
+    client = api.STLClient(server=args.server, sync_port=args.sync_port)
+    client.connect()
+    cleaned = []
+    try:
+        client.acquire(ports=ports, force=True)
+        cleaned.append("порты захвачены")
+        try:
+            if client.is_traffic_active(ports=ports):
+                client.stop(ports=ports)
+                cleaned.append("трафик остановлен")
+        except Exception:
+            pass
+        for name in ("remove_all_captures", "clear_captures"):
+            killer = getattr(client, name, None)
+            if killer is not None:
+                try:
+                    killer()
+                    cleaned.append("записи сняты")
+                except Exception:
+                    pass
+                break
+        service = lease.get("service_ports") or ports
+        try:
+            client.set_service_mode(ports=service, enabled=False)
+            cleaned.append("сервисный режим выключен")
+        except Exception as exc:
+            emit(quiet, ev="note",
+                 msg="сервисный режим снять не удалось: %s" % exc)
+        was = lease.get("promiscuous")
+        if was:
+            try:
+                client.set_port_attr(ports=[was[0]], promiscuous=bool(was[1]))
+                cleaned.append("promiscuous возвращён")
+            except Exception as exc:
+                emit(quiet, ev="note",
+                     msg="promiscuous вернуть не удалось: %s" % exc)
+        try:
+            client.release(ports=ports)
+            cleaned.append("порты отданы")
+        except Exception:
+            pass
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+    drop_lease(path)
+
+    said = "убрано: " + ", ".join(cleaned) if cleaned else "убирать было нечего"
+    emit(quiet, ev="note", msg=said)
+    print(said)
+    last = ("ИЗМЕРЕНИЕ НЕ ВОССТАНОВЛЕНО - освобождены только ресурсы. Прогон, "
+            "за которым убирали, не состоялся, и его цифры брать нельзя")
+    emit(quiet, ev="note", msg=last)
+    print(last)
+    return 0
+
+
 def run(api, args, streams, pg_ids, uncounted, quiet):
     """Drive the server through one run. Returns the result dict."""
     counted_all = bool(pg_ids) and not uncounted
@@ -676,13 +1328,62 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
     client.connect()
     # Оба до try: в finally они читаются, а дотуда можно долететь и с отказа на
     # самом захвате портов, когда ни то, ни другое ещё не заводилось.
-    service_on = False
+    # Именно те порты, которые переключили МЫ, и только они возвращаются обратно.
+    # Флаг «да/нет» этого не различал, а возвращать чужое переключение так же
+    # неправильно, как не вернуть своё.
+    service_ports = []
+    promisc = None
     handles = None
+    idle = None
+    base = ZERO_BASE()
+    link_down = False
+    errors_before = {}
+    errors = {}
+    error_kinds = {}
+    lease = None
+    # Захватили ли мы порты на самом деле. Если нет - в finally нельзя трогать
+    # НИЧЕГО: и release, и disconnect с умолчаниями (stop_traffic=True,
+    # release_ports=True) бьют по портам, которые держит чужой прогон. Отказ
+    # «порт занят» обязан быть безвредным для того, кто его занял.
+    owned = False
     try:
         take_ports(client, args, ports, quiet)
+        owned = True
+        lease = write_lease(args, ports, pg_ids, quiet)
         client.add_streams(streams, ports=[args.tx_port])
-        handles = start_capture(client, args, quiet)
-        service_on = bool(handles)
+        promisc = take_promiscuous(client, args, quiet)
+        handles = start_capture(client, args, quiet, service_ports)
+        update_lease(lease, service_ports=sorted(set(service_ports)),
+                     promiscuous=list(promisc) if promisc else None)
+        # Обнуление ВТОРОЙ раз, и только теперь оно что-то значит: в take_ports
+        # наших групп на сервере ещё не существовало, так что их счётчиков то
+        # обнуление не касалось. А номер группы могли занимать до нас.
+        try:
+            client.clear_stats()
+        except Exception as exc:
+            emit(quiet, ev="note",
+                 msg="счётчики не обнулились перед замером (%s) - цифры пойдут "
+                     "разницей к тому, что было" % exc)
+        base = absolutes(client, args, pg_ids)
+        if base["group_rx"] or base["group_tx"] or base["rx_port"]:
+            # Обнулили - а там не ноль. Значит либо релиз не чистит группы,
+            # зарегистрированные после очистки, либо в сегмент уже что-то идёт.
+            # В обоих случаях абсолютная цифра не годится, и вычитание базы -
+            # единственное, что делает замер замером.
+            emit(quiet, ev="note",
+                 msg="счётчики после обнуления не нулевые (группы %d/%d, порт "
+                     "приёма %d) - дальше всё считается разницей к этому"
+                     % (base["group_tx"], base["group_rx"], base["rx_port"]))
+        emit(quiet, ev="base", group_tx=base["group_tx"],
+             group_rx=base["group_rx"], rx_port=base["rx_port"])
+        errors_before = read_xstats(client, ports)
+        # Холостой замер стоит ЗДЕСЬ, а не раньше, и это не косметика. Групп на
+        # сервере не существует, пока потоки не добавлены, а на части карт
+        # групповой счётчик приёма вообще не растёт вне сервисного режима -
+        # именно это и наблюдалось на стенде. Замер до этих двух шагов показывал
+        # бы чистый ноль на грязном сегменте, то есть врал бы ровно там, где его
+        # и завели.
+        idle = idle_check(client, args, pg_ids, base, quiet)
 
         started = time.time()
         # force здесь - НЕ про отъём чужого: порты уже наши, а отобрать их
@@ -709,10 +1410,21 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
             now = time.time()
             if now - last >= 1.0:
                 last = now
-                snap = sample(client, args, pg_ids, counted_all)
+                snap = sample(client, args, pg_ids, counted_all, base)
+                # Счётчик порта приёма едет в каждом тике рядом с групповой
+                # цифрой. Раньше sample() его читал и выбрасывал, если группа
+                # была ненулевой, - и по архиву прогона было уже не понять,
+                # сошлись они или разошлись.
+                if link_is_down(client, ports) is True and not link_down:
+                    link_down = True
+                    emit(quiet, ev="note",
+                         msg="линк на наших портах упал по ходу прогона - "
+                             "дальше тишина в кабеле выглядит как потери на "
+                             "устройстве, но описывает обрыв")
                 emit(quiet, ev="tick", t=round(now - started, 2),
                      tx=snap["tx"], rx=snap["rx"],
-                     pps=round(snap["tx_pps"], 1))
+                     rx_port=snap["rx_port"], rx_groups=snap["rx_groups"],
+                     link_down=link_down, pps=round(snap["tx_pps"], 1))
             if not client.is_traffic_active(ports=[args.tx_port]):
                 break
 
@@ -723,8 +1435,28 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         seconds = time.time() - started
         # Frames still in flight when the last one left have to land before the
         # receiving counter is read, or the tail of the run reads as loss.
-        time.sleep(0.5)
-        final = sample(client, args, pg_ids, counted_all)
+        # Полсекунды тут было взято на глаз; счётчики на разных сборках
+        # устаканиваются дольше, поэтому это параметр, а не константа.
+        time.sleep(max(0.0, args.settle))
+        final = sample(client, args, pg_ids, counted_all, base)
+        errors, error_kinds = grown_errors(errors_before,
+                                           read_xstats(client, ports))
+        for name in sorted(errors):
+            kind = error_kinds[name]
+            if kind == "generator":
+                said = ("счётчик генератора - кадры терялись на нашей стороне, "
+                        "не дойдя до устройства; потери этого прогона считать "
+                        "нельзя")
+            elif kind == "link":
+                said = "счётчик линка - смотреть кабель, оптику, согласование"
+            else:
+                said = ("незнакомый счётчик - имя приходит от драйвера, "
+                        "разбирать человеку")
+            emit(quiet, ev="note",
+                 msg="ошибки порта: %s вырос на %d - %s"
+                     % (name, errors[name], said))
+        if errors:
+            emit(quiet, ev="xstats", grew=errors, kinds=error_kinds)
         stop_capture(client, args, handles, quiet)
         handles = None            # забрали, дальше снимать нечего
     finally:
@@ -744,27 +1476,64 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
                     client.stop_capture(handle)
                 except Exception:
                     pass
-        if service_on:
+        if service_ports:
             try:
-                client.set_service_mode(ports=ports, enabled=False)
-            except Exception:
-                pass
+                client.set_service_mode(ports=sorted(set(service_ports)),
+                                        enabled=False)
+            except Exception as exc:
+                # Молчащий отказ возврата - это отравленный стенд без следа:
+                # машина остаётся в режиме, в котором не пускает трафик вообще,
+                # а следующий человек видит отказ, к его работе отношения не
+                # имеющий. Сказать вслух - единственное, что здесь можно.
+                emit(quiet, ev="note",
+                     msg="СЕРВИСНЫЙ РЕЖИМ ВЕРНУТЬ НЕ УДАЛОСЬ (%s) на портах "
+                         "%s - следующий прогон на этой машине может не "
+                         "стартовать вовсе; снимать руками"
+                         % (exc, sorted(set(service_ports))))
+        if promisc is not None:
+            port, was = promisc
+            try:
+                client.set_port_attr(ports=[port], promiscuous=was)
+            except Exception as exc:
+                emit(quiet, ev="note",
+                     msg="promiscuous на порту %d вернуть не удалось (%s) - "
+                         "порт остался в состоянии, которого не просили"
+                         % (port, exc))
         # Handed back explicitly rather than left to the disconnect: a release
         # that happens only as a side effect of closing the socket does not
         # happen when the socket is already gone, and the next person finds
         # the ports owned by a run that ended.
+        if owned:
+            try:
+                client.release(ports=ports)
+            except Exception:
+                pass
         try:
-            client.release(ports=ports)
-        except Exception:
+            if owned:
+                client.disconnect()
+            else:
+                # Ничего не наше - и уходим, ничего не тронув. Умолчания
+                # disconnect() остановили бы чужой трафик и отдали бы чужие
+                # порты, то есть отказ «порт занят» испортил бы ровно тот
+                # прогон, которого он не хотел касаться.
+                client.disconnect(stop_traffic=False, release_ports=False)
+        except TypeError:
+            # Релиз, не знающий этих параметров: лучше не отключаться вовсе,
+            # чем отключиться с умолчаниями. Сокет закроется с процессом.
             pass
-        try:
-            client.disconnect()
         except Exception:
             # Losing the connection on the way out must not replace whatever
             # actually went wrong inside the run.
             pass
+        drop_lease(lease)
 
     source = final["source"]
+    if idle and idle["rx_groups"] > 0 and source in (
+            "flow_stats", "mixed", "flow_stats_foreign", "flow_stats_noport"):
+        # Ровная цифра из отравленной группы опаснее кривой: она выглядит как
+        # измерение. Переименовать источник - единственный способ, которым это
+        # доезжает до отчёта, до JSON и до истории, а не только до текста ноты.
+        source = "flow_stats_tainted"
     note = SOURCE_NOTES.get(source, "")
     if source == "flow_stats" and final["rx"] > final["tx"]:
         note = ("аппаратный счёт дал больше, чем отправлено (%d против %d) - "
@@ -782,6 +1551,21 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         "seconds": round(seconds, 3),
         "achieved_pps": round(final["tx"] / seconds, 1) if seconds else 0.0,
         "rx_source": source,
+        # Структурно, а не по тексту ноты: по архиву прогона должно быть видно,
+        # шёл ли он в сервисном режиме (потолок скорости ниже) и что показывал
+        # приём, пока мы молчали. Без этих полей различие двух прогонов
+        # приходилось доставать диффом сгенерированных скриптов.
+        "service_mode": bool(service_ports),
+        "idle_rx": (idle or {}).get("rx_port", 0),
+        "idle_rx_groups": (idle or {}).get("rx_groups", 0),
+        # Сколько кадров нашей группы пришло мимо нашего порта приёма.
+        "rx_foreign": final.get("rx_foreign", 0),
+        # Чем гейт достоверности на принимающей стороне судит о годности замера.
+        "ordered": ORDERED,
+        "link_down": bool(link_down),
+        "port_errors": errors,
+        "generator_errors": sorted(n for n in errors
+                                   if error_kinds.get(n) == "generator"),
         # Только НЕОПРОВЕРГНУТЫЙ аппаратный счёт годится как есть. Принято
         # больше, чем послано, - это и есть опровержение: столько наших кадров
         # вернуться не могло, значит в счёт попало чужое. Найдено на стенде
@@ -822,6 +1606,22 @@ def parse_args(argv=None):
     ap.add_argument("--ship-frames", action="store_true",
                     help="вернуть образцы кадров вызывающему внутри потока "
                          "событий, ничего здесь не оставляя")
+    ap.add_argument("--lease-dir", default=LEASE_DIR,
+                    help="где держать след аренды портов на этой машине")
+    ap.add_argument("--recover-only", action="store_true",
+                    help="не слать ничего: убрать за прогоном, который не убрал "
+                         "за собой, если по следу аренды его процесс мёртв")
+    ap.add_argument("--no-promiscuous", dest="promiscuous",
+                    action="store_false",
+                    help="не включать promiscuous на порту приёма; с ним карта "
+                         "иначе отбрасывает кадры с чужим MAC и приём читается "
+                         "нулём")
+    ap.add_argument("--settle", type=float, default=2.0,
+                    help="сколько ждать дослёта кадров перед снятием "
+                         "счётчиков приёма")
+    ap.add_argument("--idle-check", type=float, default=1.0,
+                    help="сколько секунд слушать приём до старта, чтобы "
+                         "поймать чужой трафик в сегменте; 0 - не слушать")
     ap.add_argument("--force", action="store_true",
                     help="отобрать порты, даже если их держит чужой прогон")
     ap.add_argument("--dry-run", action="store_true",
@@ -851,6 +1651,17 @@ def main(argv=None):
         emit(quiet, ev="error", msg=exc.explain())
         print(exc.explain(), file=sys.stderr)
         return 3
+
+    if args.recover_only:
+        # Профиль тут ни при чём: убирают за чужим прогоном, а не шлют свой.
+        try:
+            return recover(api, args, quiet)
+        except Exception as exc:
+            msg = "уборка не удалась: %s" % exc
+            emit(quiet, ev="error", msg=msg)
+            print(msg, file=sys.stderr)
+            traceback.print_exc()
+            return 1
 
     L = layers(api)
     want_flow_stats = args.rx_port >= 0
@@ -917,6 +1728,13 @@ def main(argv=None):
         emit(quiet, ev="error", msg=str(exc))
         print(str(exc), file=sys.stderr)
         return 4
+    except Dirty as exc:
+        # И свой код: порт достался нам, но в состоянии, в котором мерить
+        # нельзя. Это не занятый порт (4) и не поломка (1) - это остаток,
+        # который надо либо разобрать руками, либо убрать явным --force.
+        emit(quiet, ev="error", msg=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 5
     except Exception as exc:
         # The release defines its own exception types and we only have them
         # after the import above, so there is nothing narrower to catch here

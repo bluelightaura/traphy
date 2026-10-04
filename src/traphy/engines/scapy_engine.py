@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from traphy import codegen
-from traphy.models import Profile
+from traphy.models import Profile, Stream, VMField, VMOp, range_size
 from traphy.probe import HostInfo
 from traphy.runspec import RunSpec
 from traphy.target import Target
@@ -31,9 +31,17 @@ class ScapyEngine:
     status = ""
     file_suffix = ".py"
     uses_ifaces = True
+    # Scapy шлёт сам и портами не владеет: убирать за убитым прогоном тут нечего
+    # и нечем - след аренды и отъём ресурсов есть только у генератора-демона.
+    can_recover = False
+    opens_raw_socket = True
+    rate_hint = "это цель, а не гарантия - ядро пасует задолго до карты"
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen.generate(profile, tag=tag)
+
+    def script_name(self, profile: Profile) -> str:
+        return codegen.script_name(profile)
 
     def interpreter(self, target: Target) -> str:
         return target.python
@@ -97,6 +105,59 @@ class ScapyEngine:
 
     def frame_count(self, profile: Profile) -> int:
         return codegen.frame_count(profile)
+
+    def rate_note(self, stream: Stream, link_mbit: int) -> str:
+        """Say out loud when a rate is beyond what this path can carry.
+
+        Scapy through a kernel socket tops out well below a NIC. Somewhere
+        around a hundred thousand frames a second the loop stops keeping up,
+        and a run that quietly delivers a third of what was asked reads as a
+        device problem when it is a tool problem.
+        """
+        pps = stream.pps(link_mbit)
+        if pps > 200_000:
+            return f"! ~{pps:,.0f} pps - Scapy столько не выдаст, возьми меньше"
+        if pps > 50_000:
+            return f"~{pps:,.0f} pps - на грани того, что Scapy тянет"
+        return ""
+
+    def range_note(self, vf: VMField) -> str:
+        """Flag a range that will be truncated before the run finds out for us.
+
+        This engine expands a sweep into concrete frames at build time, so a
+        /16 is not a /16 here. TRex hands the same range to a field engine and
+        walks all of it, which is why the limit belongs to the engine rather
+        than to the range.
+        """
+        size = range_size(vf)
+        if vf.op is not VMOp.RANDOM and size > codegen.EXPAND_CAP:
+            return (f"! {size} значений - на Scapy урежется до "
+                    f"{codegen.EXPAND_CAP}, TRex обойдёт все; возьми шаг "
+                    f"больше или диапазон уже")
+        return ""
+
+    def describe_host(self, host: HostInfo) -> str:
+        return (f"scapy {host.scapy_version}" if host.has_scapy
+                else "без scapy")
+
+    def warnings(self, profile: Profile) -> list[str]:
+        """What this profile loses on Scapy, said before the run rather than
+        after. The script reports a truncated sweep too, but only once it is
+        running - by then the narrower range is already what got measured.
+        """
+        out: list[str] = []
+        for s in profile.enabled_streams:
+            for vf in s.vm_fields:
+                size = range_size(vf)
+                if vf.op is not VMOp.RANDOM and size > codegen.EXPAND_CAP:
+                    out.append(f"поток «{s.name}»: {vf.describe()} - "
+                               f"{size} значений, развернутся первые "
+                               f"{codegen.EXPAND_CAP}")
+                elif vf.op is VMOp.RANDOM:
+                    out.append(f"поток «{s.name}»: случайный перебор - "
+                               f"пул из {codegen.RANDOM_POOL} кадров, "
+                               f"а не весь диапазон")
+        return out
 
     def describe_result(self, event: dict[str, Any]) -> str:
         return ""

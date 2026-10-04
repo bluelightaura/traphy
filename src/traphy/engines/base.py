@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:  # pragma: no cover - imported for types only
     from pathlib import Path
 
-    from traphy.models import Profile
+    from traphy.models import Profile, Stream, VMField
     from traphy.probe import HostInfo
     from traphy.runner import RunSpec
     from traphy.target import Target
@@ -35,9 +35,20 @@ class Engine(Protocol):
     status: str         # why it is not ready, when it is not
     file_suffix: str    # what the generated artefact is called
     uses_ifaces: bool   # whether a NIC name is how this engine names a port
+    can_recover: bool   # whether it can clean up after a run that was killed
+    opens_raw_socket: bool  # whether the run itself needs a socket the kernel guards
+    rate_hint: str      # the standing note under the rate field
 
     def generate(self, profile: Profile, tag: str) -> str:
         """The artefact to ship: a script, a plan, a config."""
+
+    def script_name(self, profile: Profile) -> str:
+        """What the artefact is called when it is saved or shown.
+
+        The script screen and the save key ask for it here rather than from one
+        generator, so "what you look at is what runs" holds for every engine
+        and not only for the one that happens to be the default.
+        """
 
     def interpreter(self, target: Target) -> str:
         """What runs the artefact on the host."""
@@ -72,6 +83,39 @@ class Engine(Protocol):
     def frame_count(self, profile: Profile) -> int:
         """How many distinct units of work the artefact will build."""
 
+    def rate_note(self, stream: Stream, link_mbit: int) -> str:
+        """What this engine has to say about a rate just accepted.
+
+        ``link_mbit`` is not optional, because the only interesting thing to
+        say about a rate is how it compares to something - the line, or what
+        the sending path can pace - and a default would price "50% of the line"
+        against a gigabit on a target that has twenty-five of them.
+        """
+
+    def range_note(self, vf: VMField) -> str:
+        """What this engine will do to a range it cannot walk in full.
+
+        Policy, not validation: whether a sweep is truncated depends on who
+        builds the frames. Whether its ends parse at all does not, and stays
+        with the model.
+        """
+
+    def describe_host(self, host: HostInfo) -> str:
+        """What this engine wants to see on the host, in one line, or nothing.
+
+        The "what answered" line is the same line for every engine, and what
+        belongs in it is not: a TRex client has no use for Scapy and an Ixia
+        one has no use for either.
+        """
+
+    def warnings(self, profile: Profile) -> list[str]:
+        """What this profile gives up on this engine, before it is sent.
+
+        Not the same as :meth:`target_problems`: nothing here stops a run. It
+        is what the run will quietly fail to measure, which is worth reading
+        while the traffic is still being composed.
+        """
+
     def describe_result(self, event: dict[str, Any]) -> str:
         """A short line for a finished run, when the engine has one to add."""
 
@@ -92,6 +136,13 @@ class Declared:
     status = "ещё не реализован"
     file_suffix = ".txt"
     uses_ifaces = True
+    # Убирать за убитым прогоном умеет не всякий генератор: нужен и след на той
+    # машине, и способ отобрать ресурсы у мёртвого владельца. У Scapy, который
+    # шлёт сам и ничем не владеет, такой операции нет вовсе - и заставлять её
+    # реализовать нельзя, поэтому умолчание отрицательное.
+    can_recover = False
+    opens_raw_socket = False
+    rate_hint = ""
 
     def _refuse(self) -> EngineNotReady:
         return EngineNotReady(
@@ -100,6 +151,11 @@ class Declared:
 
     def generate(self, profile, tag):
         raise self._refuse()
+
+    def script_name(self, profile):
+        """A name even for an artefact nobody can build yet: the save screen
+        offers a filename before it ever calls the generator."""
+        return f"{profile.name}{self.file_suffix}"
 
     def interpreter(self, target):
         raise self._refuse()
@@ -111,7 +167,15 @@ class Declared:
         return False
 
     def port_labels(self, target):
-        """Interface names, until an engine says otherwise."""
+        """Interface names, until an engine says otherwise.
+
+        Saying otherwise is :attr:`uses_ifaces`: an engine that does not name
+        ports by NIC has no interface to report either, and reporting one the
+        target form never asked for is how a launcher line ends up describing
+        the engine that was selected before this one.
+        """
+        if not self.uses_ifaces:
+            return "", ""
         return target.tx_iface, target.rx_iface
 
     def target_problems(self, target):
@@ -121,5 +185,41 @@ class Declared:
     def frame_count(self, profile):
         return 0
 
+    def rate_note(self, stream, link_mbit):
+        """Nothing to compare against: what this engine can pace is not known
+        until it exists."""
+        return ""
+
+    def range_note(self, vf):
+        return ""
+
+    def describe_host(self, host):
+        """Silence rather than somebody else's requirement - the line this fills
+        in used to say "без scapy" about engines that never wanted it."""
+        return ""
+
+    def warnings(self, profile):
+        return []
+
     def describe_result(self, event):
         return ""
+
+
+def line_rate_note(stream: Stream, link_mbit: int, who: str) -> str:
+    """"More than the port can carry", for an engine that does hold line rate.
+
+    Shared by TRex and Ixia because the arithmetic is the cable's, not the
+    generator's. Only the ceiling is worth saying: below it these engines
+    deliver what was asked, so a note on every value would train the eye to
+    skip the one that matters.
+    """
+    size = max(stream.packet.frame_size, 1)
+    # L1: кадр на проводе несёт ещё преамбулу, FCS и межкадровый интервал -
+    # те же 24 байта, которыми Stream.pps считает «% от линии».
+    ceiling = link_mbit * 1e6 / ((size + 24) * 8)
+    pps = stream.pps(link_mbit)
+    if pps > ceiling:
+        return (f"! ~{pps:,.0f} pps - больше линии {link_mbit} Мбит/с, "
+                f"при {size} B это {ceiling:,.0f} pps; {who} отдаст линию "
+                f"и прогон выйдет короче запрошенного")
+    return ""

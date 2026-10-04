@@ -28,13 +28,16 @@ from typing import TYPE_CHECKING, Any
 
 from traphy import codegen_stl
 from traphy.engines import inventory
-from traphy.models import Profile
+from traphy.engines.base import line_rate_note
+from traphy.models import Profile, Stream
 from traphy.probe import HostInfo
 from traphy.runspec import RunSpec
 from traphy.target import Target
 
 if TYPE_CHECKING:  # pragma: no cover - imported for types only
     from pathlib import Path
+
+    from traphy.models import VMField
 
 # What each way of counting the receive side is worth, in one line. Every
 # result carries one of these; a loss figure whose provenance went unsaid is
@@ -47,6 +50,14 @@ RX_SOURCES = {
     "flow_stats_blind": "аппаратные группы не сосчитали приём вообще, хотя "
                         "порт кадры принял - цифра взята со счётчика порта. "
                         "Проверять надо карту и драйвер, а не коробку",
+    "flow_stats_unverified": "аппаратные группы показали ноль, а счётчик "
+                             "порта приёма не прочитался - сверить было нечем, "
+                             "поэтому ноль подан как неточный",
+    "flow_stats_tainted": "в наши группы на приёме шли кадры ещё до старта - "
+                          "в сегменте чужой трафик с той же меткой группы, и "
+                          "аппаратный счёт тут ничего не измеряет",
+    "partial": "счётчики пришли не по всем потокам - потери посчитаны не по "
+               "всему прогону",
     "port_counter": "приём посчитан счётчиком порта - там лежат не только "
                     "наши кадры",
     "none": "приём не измерялся - порт приёма не задан",
@@ -62,9 +73,18 @@ class TrexEngine:
     status = ""
     file_suffix = ".py"
     uses_ifaces = False
+    # Единственный движок, который умеет убрать за убитым прогоном: у него есть
+    # и след аренды на машине-генераторе, и способ отобрать ресурсы у мёртвого
+    # владельца, когда доказано, что владелец мёртв.
+    can_recover = True
+    opens_raw_socket = False
+    rate_hint = "скорость держит карта - до линейной скорости порта"
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen_stl.generate(profile, tag=tag)
+
+    def script_name(self, profile: Profile) -> str:
+        return codegen_stl.script_name(profile)
 
     def interpreter(self, target: Target) -> str:
         """The target's own Python. The release's library is put on its path by
@@ -73,6 +93,19 @@ class TrexEngine:
         return target.python
 
     def args(self, target: Target, spec: RunSpec, archive: Path | None) -> list[str]:
+        if spec.recover:
+            # Уборка не шлёт ничего, и всё, что про отправку, тут только мешает:
+            # длительность, скорость, запись. Нужны ровно порты и демон.
+            args = [
+                "--trex-dir", target.trex_dir,
+                "--server", target.trex_server,
+                "--sync-port", str(target.trex_sync_port),
+                "--tx-port", str(target.trex_port_tx),
+                "--recover-only",
+            ]
+            if target.trex_port_rx >= 0:
+                args += ["--rx-port", str(target.trex_port_rx)]
+            return args
         args = [
             "--trex-dir", target.trex_dir,
             "--server", target.trex_server,
@@ -82,10 +115,16 @@ class TrexEngine:
         ]
         if target.trex_port_rx >= 0:
             args += ["--rx-port", str(target.trex_port_rx)]
-        if target.trex_force:
+        if target.trex_force or spec.force:
             # Off unless the operator turned it on, and the script refuses a
             # busy port without it. The generator is shared: evicting somebody
             # mid-measurement has to be a decision, not a default.
+            #
+            # Два источника нарочно. В цели тумблер липкий: включённый ради
+            # одной проверки, он остаётся включённым для всех следующих
+            # прогонов - и человек об этом не помнит. ``spec.force`` живёт один
+            # прогон, и именно он должен быть обычным способом; тумблер в цели
+            # остаётся для стенда, где отбирать приходится каждый раз.
             args.append("--force")
         if spec.pps:
             # TRex scales a whole profile with one multiplier, and it takes the
@@ -157,13 +196,35 @@ class TrexEngine:
     def frame_count(self, profile: Profile) -> int:
         return codegen_stl.frame_count(profile)
 
+    def rate_note(self, stream: Stream, link_mbit: int) -> str:
+        """Nothing to warn about below the line - that is what DPDK is for."""
+        return line_rate_note(stream, link_mbit, "карта")
+
+    def range_note(self, vf: VMField) -> str:
+        """The field engine walks a range on the card, whatever its size, so
+        there is no truncation to report."""
+        return ""
+
+    def describe_host(self, host: HostInfo) -> str:
+        """What the target has of TRex, in the order it has to be fixed.
+
+        Empty when there is no release at all: that is a blocker with its own
+        wording, and this line is for what answered, not for what is missing.
+        """
+        if not host.has_trex:
+            return ""
+        where = host.trex_dir or "TRex"
+        version = f" {host.trex_version}" if host.trex_version else ""
+        if not host.has_trex_stl:
+            return f"{where}{version} - без control plane"
+        return f"TRex{version} в {where} · " + ("демон отвечает"
+                                                if host.trex_daemon
+                                                else "демон не поднят")
+
     def describe_result(self, event: dict[str, Any]) -> str:
         return RX_SOURCES.get(str(event.get("rx_source", "")), "")
 
     def warnings(self, profile: Profile) -> list[str]:
-        """What this profile gives up on TRex, before it is sent rather than
-        after. Not part of the engine protocol - the builder screen asks for it
-        by name, because only this engine has anything to say here."""
         return codegen_stl.warnings(profile)
 
     def readiness(self, target: Target) -> inventory.Readiness:

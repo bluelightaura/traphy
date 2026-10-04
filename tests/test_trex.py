@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from typing import ClassVar
 
 import pytest
 import scapy.all as scapy
@@ -95,6 +96,7 @@ class FakeClient:
         self.calls: list = []
         self.streams: list = []
         self.polls = 0
+        self._idle_reads = 0
         FakeClient.last = self
 
     def connect(self):
@@ -124,8 +126,39 @@ class FakeClient:
     capture_fails = False
     stop_fails = False
 
+    # Атрибуты порта, как их отдаёт демон. По ним прогон судит о двух разных
+    # вещах: об остатке, который оставил кто-то до нас (сервисный режим забыли
+    # выключить), и об обрыве посреди замера (линк упал). Обе проверки до этого
+    # были написаны вслепую - подделка про атрибуты не знала вовсе.
+    port_service = False
+    port_link = "UP"
+
+    # Счётчики ошибок портов, как их отдаёт драйвер: имя -> значение. Прогон
+    # читает их до и после и смотрит прирост, поэтому в подделке это две
+    # картины, а не одна.
+    xstats_before: ClassVar[dict] = {}
+    xstats_after: ClassVar[dict] = {}
+
+    def get_xstats(self, port):
+        if not getattr(self, "flowing", False):
+            return dict(FakeClient.xstats_before)
+        return dict(FakeClient.xstats_after)
+
+    def get_port_attr(self, port):
+        return {"service": FakeClient.port_service,
+                "link": FakeClient.port_link}
+
+    # Возврат сервисного режима может не удаться - и это самый дорогой отказ на
+    # общей машине: она остаётся в состоянии, в котором не пускает трафик вообще.
+    service_restore_fails = False
+
     def set_service_mode(self, ports=None, enabled=False):
         self.calls.append(("service_mode", tuple(ports or ()), enabled))
+        if not enabled and FakeClient.service_restore_fails:
+            raise RuntimeError("порты заняты, режим не снять")
+
+    def set_port_attr(self, ports=None, promiscuous=None, **kw):
+        self.calls.append(("port_attr", tuple(ports or ()), promiscuous))
 
     def start_capture(self, **spec):
         if FakeClient.capture_fails:
@@ -144,13 +177,40 @@ class FakeClient:
         self.streams = list(streams)
         self.calls.append(("add_streams", tuple(ports or ())))
 
+    # Две разные вещи, которые на стенде дают одинаково большую цифру и лечатся
+    # по-разному, поэтому и знобки две.
+    #
+    # stale_rx - счётчик, не обнулившийся с прошлого раза: постоянное смещение.
+    # Оно видно и в опорной точке, и потом, прирост от него нулевой - и
+    # вычитание опорной точки обязано его снять, оставив замер замером.
+    #
+    # idle_rx - живой чужой приток между опорной точкой и стартом: его в
+    # опорной точке ещё нет, он появляется за паузу. Это уже не смещение, а
+    # отравленная группа, и верить ей нельзя.
+    stale_rx = 0
+    idle_rx = 0
+
     def clear_stats(self):
         self.calls.append("clear_stats")
+        # Обнуление - не декорация: между ним и стартом счётчики реально стоят
+        # в нуле, и холостой замер прогона читает именно это окно. Подделка,
+        # отдающая итоговые цифры всегда, показывала бы грязный сегмент в
+        # каждом тесте и делала бы проверку бессмысленной.
+        self.flowing = False
 
     def start(self, ports=None, duration=0, mult="1", force=False):
         self.calls.append(("start", tuple(ports or ()), duration, mult, force))
+        self.flowing = True
+
+    # Остался ли на портах трафик от прогона, который за собой не убрал.
+    # Подделка обязана отличать «до старта» от «во время»: предстартовая
+    # проверка остатка спрашивает то же самое и до старта обязана слышать
+    # «нет», иначе чистая машина выглядит грязной.
+    traffic_before_start = False
 
     def is_traffic_active(self, ports=None):
+        if not getattr(self, "flowing", False):
+            return FakeClient.traffic_before_start
         self.polls += 1
         return self.polls <= FakeClient.active_polls
 
@@ -171,15 +231,31 @@ class FakeClient:
     # no entry for a port it was not asked about.
     str_keys = False
     drop_rx_port = False
+    # Порт, на котором группа считает приём, - тот же, что тесты задают в
+    # --rx-port. Плюс два состояния, которые на стенде и наблюдались: кадры с
+    # нашей меткой пришли мимо этого порта, и разбивки по порту нет вовсе.
+    rx_port_index = 1
+    group_rx_foreign = 0
+    group_rx_no_port = False
 
     def get_stats(self):
+        if not getattr(self, "flowing", True):
+            return self._idle_stats()
         groups = {}
         counted = [s for s in self.streams if s.flow_stats is not None]
         seen = FakeClient.rx if FakeClient.group_rx is None else FakeClient.group_rx
         for s in counted:
+            mine = seen // len(counted)
+            # Группа считает по портам, а не только итогом. Разбивка здесь не
+            # украшение: именно по ней прогон отличает «наш кадр принят там, где
+            # мы его ждём» от «кадр с нашей меткой пришёл куда-то ещё».
+            rx = {"total": mine + FakeClient.group_rx_foreign}
+            if not FakeClient.group_rx_no_port:
+                rx[FakeClient.rx_port_index] = mine
             groups[s.flow_stats.kw["pg_id"]] = {
-                "tx_pkts": {"total": FakeClient.tx // len(counted)},
-                "rx_pkts": {"total": seen // len(counted)},
+                "tx_pkts": {"total": FakeClient.tx // len(counted),
+                            0: FakeClient.tx // len(counted)},
+                "rx_pkts": rx,
             }
         out = {
             0: {"opackets": FakeClient.tx, "obytes": FakeClient.tx * 64,
@@ -193,6 +269,29 @@ class FakeClient:
             out = {(str(k) if isinstance(k, int) else k): v
                    for k, v in out.items()}
         return out
+
+    def _idle_stats(self):
+        """Счётчики в окне между обнулением и стартом: наше молчание.
+
+        Первое чтение - опорная точка: виден только несброшенный остаток.
+        Следующие - уже после паузы, и в них добавляется то, что успело
+        прилететь само.
+        """
+        seen = self._idle_reads
+        self._idle_reads = seen + 1
+        idle = FakeClient.stale_rx + (FakeClient.idle_rx if seen else 0)
+        counted = [s for s in self.streams if s.flow_stats is not None]
+        groups = {}
+        for s in counted:
+            share = idle // len(counted)
+            groups[s.flow_stats.kw["pg_id"]] = {
+                "tx_pkts": {"total": 0, 0: 0},
+                "rx_pkts": {"total": share,
+                            FakeClient.rx_port_index: share},
+            }
+        return {0: {"opackets": 0, "obytes": 0, "tx_pps": 0.0},
+                1: {"ipackets": idle},
+                "flow_stats": groups}
 
 
 @pytest.fixture
@@ -212,6 +311,16 @@ def fake_trex(monkeypatch):
     FakeClient.owner = ""
     FakeClient.str_keys = False
     FakeClient.drop_rx_port = False
+    FakeClient.idle_rx = 0
+    FakeClient.stale_rx = 0
+    FakeClient.port_service = False
+    FakeClient.port_link = "UP"
+    FakeClient.xstats_before = {}
+    FakeClient.xstats_after = {}
+    FakeClient.service_restore_fails = False
+    FakeClient.traffic_before_start = False
+    FakeClient.group_rx_foreign = 0
+    FakeClient.group_rx_no_port = False
     FakeClient.capture_fails = False
     FakeClient.stop_fails = False
     FakeClient.capture_bytes = b"\xd4\xc3\xb2\xa1rest-of-a-pcap"
@@ -222,6 +331,16 @@ def fake_trex(monkeypatch):
     FakeClient.owner = ""
     FakeClient.str_keys = False
     FakeClient.drop_rx_port = False
+    FakeClient.idle_rx = 0
+    FakeClient.stale_rx = 0
+    FakeClient.port_service = False
+    FakeClient.port_link = "UP"
+    FakeClient.xstats_before = {}
+    FakeClient.xstats_after = {}
+    FakeClient.service_restore_fails = False
+    FakeClient.traffic_before_start = False
+    FakeClient.group_rx_foreign = 0
+    FakeClient.group_rx_no_port = False
     FakeClient.capture_fails = False
     FakeClient.stop_fails = False
 

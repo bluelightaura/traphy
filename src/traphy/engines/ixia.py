@@ -32,13 +32,16 @@ from typing import TYPE_CHECKING, Any
 
 from traphy import codegen_ixnet
 from traphy.engines import inventory
-from traphy.models import Profile
+from traphy.engines.base import line_rate_note
+from traphy.models import Profile, Stream
 from traphy.probe import HostInfo
 from traphy.runspec import RunSpec
 from traphy.target import Target
 
 if TYPE_CHECKING:  # pragma: no cover - imported for types only
     from pathlib import Path
+
+    from traphy.models import VMField
 
 # The environment variable the generated script reads its password from. Named
 # here so the target form, the validation and the script all agree on it.
@@ -81,9 +84,17 @@ class IxiaEngine:
     status = ""
     file_suffix = ".py"
     uses_ifaces = False
+    # Шасси порты отдаёт, но следа аренды на нём traphy не ведёт - пока уборка
+    # за убитым прогоном тут не реализована, а врать про умение нельзя.
+    can_recover = False
+    opens_raw_socket = False
+    rate_hint = "скорость держит шасси - до линейной скорости порта"
 
     def generate(self, profile: Profile, tag: str) -> str:
         return codegen_ixnet.generate(profile, tag=tag)
+
+    def script_name(self, profile: Profile) -> str:
+        return codegen_ixnet.script_name(profile)
 
     def interpreter(self, target: Target) -> str:
         """Whatever Python has ``ixnetwork-restpy`` - normally this machine's.
@@ -110,7 +121,9 @@ class IxiaEngine:
             # Passed on rather than dropped: the script refuses it with the
             # reason and the way to get what was actually wanted.
             args += ["--count", str(spec.count)]
-        if target.ixia_force:
+        if target.ixia_force or spec.force:
+            # Липкий тумблер цели или решение на один прогон - см. тот же
+            # разбор в движке TRex.
             args.append("--force")
         if spec.dry_run:
             args.append("--dry-run")
@@ -159,6 +172,21 @@ class IxiaEngine:
 
     def frame_count(self, profile: Profile) -> int:
         return codegen_ixnet.frame_count(profile)
+
+    def rate_note(self, stream: Stream, link_mbit: int) -> str:
+        return line_rate_note(stream, link_mbit, "шасси")
+
+    def range_note(self, vf: VMField) -> str:
+        """The chassis counts through a range itself - nothing is expanded
+        here, so nothing is cut short."""
+        return ""
+
+    def describe_host(self, host: HostInfo) -> str:
+        """Only one thing has to be here; the chassis is checked by the run."""
+        if not host.has_ixnetwork:
+            return "нет ixnetwork-restpy"
+        version = f" {host.ixnetwork_version}" if host.ixnetwork_version else ""
+        return f"ixnetwork-restpy{version}"
 
     def describe_result(self, event: dict[str, Any]) -> str:
         return RX_SOURCES.get(str(event.get("rx_source", "")), "")

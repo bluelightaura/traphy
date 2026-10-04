@@ -28,6 +28,7 @@ from traphy.cli.commands import (
     cmd_history,
     cmd_presets,
     cmd_probe,
+    cmd_recover,
     cmd_run,
     cmd_targets,
 )
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         "gen": cmd_gen,
         "run": cmd_run,
         "probe": cmd_probe,
+        "recover": cmd_recover,
         "presets": cmd_presets,
         "targets": cmd_targets,
         "history": cmd_history,

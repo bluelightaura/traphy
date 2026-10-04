@@ -70,6 +70,7 @@ def execute(profile: Profile, target: Target, spec: RunSpec | None = None,
         tx_iface=target.tx_label(), rx_iface=target.rx_label(),
         requested_pps=spec.pps or profile.total_pps(target.link_mbit),
         dry_run=spec.dry_run,
+        requested_seconds=0.0 if spec.count else float(spec.duration),
         started_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
     )
 
@@ -121,6 +122,7 @@ def execute(profile: Profile, target: Target, spec: RunSpec | None = None,
             on_event(event)
 
     timeout = int(spec.duration + TIMEOUT_MARGIN)
+    completed = None
     try:
         completed = transport.run_stream(
             script, args, handle, timeout=timeout,
@@ -129,6 +131,19 @@ def execute(profile: Profile, target: Target, spec: RunSpec | None = None,
     finally:
         if own_transport:
             transport.close()
+        if completed is None and archive:
+            # Оборванный транспорт - ровно тот случай, ради которого архив и
+            # заводят: порты могли остаться за мёртвым прогоном, и единственный
+            # след того, что происходило, это накопленные события. Раньше
+            # исключение уходило наверх до записи, result.json не появлялся
+            # вовсе, и каталог прогона выглядел недописанным мусором.
+            apply_events(result, events)
+            result.rc = result.rc or 1
+            if not result.note:
+                result.note = (first_error(events)
+                               or "прогон оборвался - связь с целью потеряна")
+            archive.finish(result, "")
+            result.run_dir = str(archive.path)
 
     apply_events(result, events)
     if archive and captures:

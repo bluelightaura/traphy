@@ -47,7 +47,17 @@ def build_parser() -> argparse.ArgumentParser:
                           "скорости, для предельного замера её выключают")
     run.add_argument("--capture-limit", type=int, default=1000,
                      help="сколько кадров записать на сторону (по умолчанию 1000)")
+    run.add_argument("--force", action="store_true",
+                     help="отобрать порт у чужого прогона - только на этот "
+                          "раз, в цель не записывается")
     run.add_argument("--json", action="store_true", help="результат как JSON")
+
+    recover = sub.add_parser(
+        "recover",
+        help="убрать за прогоном, который не убрал за собой: порты, "
+             "сервисный режим, записи")
+    recover.add_argument("-t", "--target", default="",
+                         help="имя сохранённой цели")
 
     probe = sub.add_parser("probe", help="что есть на цели: интерфейсы, root, scapy")
     probe.add_argument("-t", "--target", default="", help="имя сохранённой цели")

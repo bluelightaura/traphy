@@ -20,7 +20,13 @@ from pathlib import Path
 from traphy import codegen, engines, presets
 from traphy.cli.resolve import load_profile, load_target
 from traphy.probe import inspect
-from traphy.runner import RunSpec, execute, explain_zero, recent_runs
+from traphy.runner import (
+    RunSpec,
+    execute,
+    explain_zero,
+    parse_event,
+    recent_runs,
+)
 from traphy.transport import ssh_password, sudo_password
 from traphy.target import TargetStore
 from traphy.transport import TransportError, open_transport
@@ -39,7 +45,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
     except engines.EngineNotReady as exc:
         print(f"! {exc}", file=sys.stderr)
         return 2
-    for warning in getattr(engine, "warnings", lambda _p: [])(profile):
+    for warning in engine.warnings(profile):
         print(f"! {warning}", file=sys.stderr)
     if not args.out:
         sys.stdout.write(text)
@@ -57,7 +63,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     target = load_target(args.target)
     spec = RunSpec(duration=args.duration, pps=args.pps, dry_run=args.dry_run,
                    count=args.count, capture=not args.no_capture,
-                   capture_limit=args.capture_limit)
+                   capture_limit=args.capture_limit, force=args.force)
     # Откуда именно полетит - первым делом и на stderr, чтобы в конвейере
     # остался только результат. Два режима Scapy различаются здесь и нигде
     # больше: локально скрипт исполняется тут же, по SSH - на той машине.
@@ -74,6 +80,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         print(result.summary())
         print(f"  транспорт: {result.transport}", file=sys.stderr)
+        # Всё, что прогон сказал вслух по ходу дела. Раньше этого в CLI не было
+        # вовсе: отъём портов, пустая запись, незапустившийся захват - каждая
+        # такая фраза доезжала только до архива и до панели в меню, а человек
+        # с терминалом узнавал о них в лучшем случае потом.
+        for said in result.notes:
+            print(f"  · {said}", file=sys.stderr)
         if result.captures:
             for name in sorted(result.captures):
                 print(f"  дамп {name}: {result.captures[name]}", file=sys.stderr)
@@ -88,10 +100,65 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def _echo(event: dict) -> None:
     """Mirror the run's progress on stderr so stdout stays the result."""
-    if event.get("ev") == "tick":
+    kind = event.get("ev")
+    if kind == "tick":
         print(f"  {event.get('t', 0):5.1f} c  tx={event.get('tx', 0)}"
               f"  rx={event.get('rx', 0)}  {event.get('pps', 0):.0f} pps",
               file=sys.stderr)
+    elif kind in ("note", "error"):
+        # Сказанное по ходу прогона печатается тогда же, когда сказано.
+        # Дождаться итога тут мало: прогон, оборвавшийся после такой фразы,
+        # уносил её с собой.
+        said = str(event.get("msg", "")).strip()
+        if said:
+            print(f"  · {said}", file=sys.stderr)
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    """Убрать за прогоном, который не убрал за собой.
+
+    Отдельная команда, а не флаг прогона, потому что это и не прогон: ничего не
+    отправляется, и профиль тут ни при чём. Нужна она ровно для одного случая -
+    прогон убили сигналом или оборвали SSH, его ``finally`` не исполнился, и на
+    машине остались занятые порты, включённый сервисный режим и живая запись.
+    Следующий человек видит отказ, к его работе отношения не имеющий.
+    """
+    target = load_target(args.target)
+    engine = engines.get(target.engine)
+    if not engine.can_recover:
+        print(f"! «{engine.title}» убирать за прогоном не умеет: у него нет ни "
+              f"следа аренды на той машине, ни владения портами", file=sys.stderr)
+        return 2
+    spec = RunSpec(recover=True, archive=False, capture=False)
+    # Артефакт тот же, что у прогона: уборка - его отдельный режим, а не второй
+    # скрипт, который пришлось бы поддерживать отдельно. Профиль ему при этом не
+    # нужен ни для чего - до сборки потоков дело не доходит, - поэтому берётся
+    # самый простой.
+    script = engine.generate(presets.build("l2_ethernet"),
+                             tag=codegen.DEFAULT_TAG)
+    print(f"режим: {target.endpoint()}", file=sys.stderr)
+    try:
+        transport = open_transport(target, password=ssh_password())
+    except TransportError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 3
+
+    def say(line: str) -> None:
+        event = parse_event(line)
+        if event is not None:
+            _echo(event)
+
+    try:
+        completed = transport.run_stream(
+            script, engine.args(target, spec, None), say, timeout=120,
+            sudo=target.use_sudo and engine.needs_root(spec),
+            secret=sudo_password())
+    except TransportError as exc:
+        print(f"! {exc}", file=sys.stderr)
+        return 3
+    finally:
+        transport.close()
+    return completed.rc
 
 
 def cmd_probe(args: argparse.Namespace) -> int:

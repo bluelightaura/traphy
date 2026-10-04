@@ -372,8 +372,18 @@ class SshTransport(Transport):
                 f"Если она действительно переустановлена, убери её строку из "
                 f"{known_hosts_path()} вручную и подключись заново") from exc
         except paramiko.AuthenticationException as exc:
+            # Назвать ВСЕ три способа, а не только тот, который уже не сработал.
+            # Прежняя формулировка советовала проверить ключ и агента - и
+            # умалчивала про поле «пароль SSH», которое стоит на том же экране
+            # строкой выше. Человек с неавторизованным ключом читал её как
+            # «чини ключ» и упирался в неё раз за разом.
+            how = ("задай пароль - в настройке цели поле «пароль SSH», "
+                   "или переменной TRAPHY_SSH_PASSWORD"
+                   if not password else
+                   "пароль не подошёл - проверь его, либо задай ключ")
             raise TransportError(
-                f"{user}@{host}: логин не принят - проверь ключ или агента") from exc
+                f"{user}@{host}: логин не принят. {how}; "
+                f"ключ можно положить на хост через ssh-copy-id") from exc
         except paramiko.SSHException as exc:
             raise TransportError(_ssh_hint(host, user, exc, self.host_key_mode)) from exc
         except OSError as exc:

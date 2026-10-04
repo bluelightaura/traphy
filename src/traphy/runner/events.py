@@ -1,7 +1,8 @@
 """The ``@traphy`` event stream: one line of JSON at a time, folded into a result.
 
-Every engine's generated script speaks the same six events - ``stream``,
-``ready``, ``tick``, ``done``, ``error``, ``note`` - and this module is the only
+Every engine's generated script speaks the same events - ``stream``,
+``ready``, ``tick``, ``capture``, ``done``, ``error``, ``note`` - and this
+module is the only
 place that knows what they mean. That is what keeps an engine from having to
 also be a result parser: adding a generator means emitting these lines, not
 teaching the runner a new dialect.
@@ -40,7 +41,11 @@ def parse_event(line: str) -> dict[str, Any] | None:
 
 
 def apply_events(result: RunResult, events: list[dict[str, Any]]) -> None:
-    """Fold the event stream into the result, last word wins."""
+    """Fold the event stream into the result.
+
+    Counters are last-word-wins: a later tick supersedes an earlier one. What
+    the script *said* is not - see :func:`_remember`.
+    """
     for event in events:
         kind = event.get("ev")
         if kind == "ready":
@@ -56,12 +61,44 @@ def apply_events(result: RunResult, events: list[dict[str, Any]]) -> None:
             result.achieved_pps = float(event.get("achieved_pps", 0.0))
             result.rx_source = str(event.get("rx_source", "none"))
             result.reliable = bool(event.get("reliable", False))
+            result.service_mode = bool(event.get("service_mode", False))
+            result.idle_rx = int(event.get("idle_rx", 0) or 0)
+            result.idle_rx_groups = int(event.get("idle_rx_groups", 0) or 0)
+            result.rx_foreign = int(event.get("rx_foreign", 0) or 0)
+            result.ordered_pkts = int(event.get("ordered", 0) or 0)
+            result.link_down = bool(event.get("link_down", False))
+            result.port_errors = dict(event.get("port_errors") or {})
+            result.generator_errors = list(event.get("generator_errors") or [])
             if event.get("truncated"):
                 result.truncated = list(event["truncated"])
-            if event.get("note"):
-                result.note = str(event["note"])
+            _remember(result, str(event.get("note", "")))
+        elif kind == "capture":
+            # Записанная сторона запоминается даже когда файл пуст: цену за
+            # запись прогон уже заплатил - у TRex это сервисный режим и
+            # пониженный потолок, - и оговорка про неё обязана прозвучать,
+            # иначе прогон выглядит медленным без объяснения.
+            name = str(event.get("name", ""))
+            if name and name not in result.recorded:
+                result.recorded.append(name)
         elif kind in ("error", "note"):
-            result.note = str(event.get("msg", "")) or result.note
+            _remember(result, str(event.get("msg", "")))
+
+
+def _remember(result: RunResult, text: str) -> None:
+    """Keep every note the script said, not only the last one.
+
+    ``note`` is a single slot and the last writer wins, which is right for the
+    headline and wrong for everything else. A mid-run sentence - an empty
+    recording, a port taken by force - is overwritten by whatever ``done`` has
+    to say about the counters, and the one line that would have stopped someone
+    reading a blank capture as loss never reaches them.
+    """
+    said = text.strip()
+    if not said:
+        return
+    if said not in result.notes:
+        result.notes.append(said)
+    result.note = said
 
 
 def first_error(events: list[dict[str, Any]]) -> str:

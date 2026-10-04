@@ -44,6 +44,11 @@ class JMeterEngine(Declared):
     ready = False
     status = "ещё не реализован"
     file_suffix = ".jmx"
+    # Порт у этого движка - не карта, а адрес службы: нагрузку задают потоки и
+    # запрос, а через какой интерфейс уйдёт TCP, решает маршрутизация. Пока
+    # стояло умолчание, форма цели спрашивала имена TX/RX и обещала sudo для
+    # сырого сокета, который JMeter не открывает никогда.
+    uses_ifaces = False
 
     def blockers(self, host: HostInfo) -> list[str]:
         out = [f"движок JMeter {self.status}"]
