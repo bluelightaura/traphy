@@ -1,10 +1,14 @@
 """Setting up a target and proving we can reach it.
 
-The form edits a copy and only adopts it on the way out, so backing out of a
-half-finished edit leaves the working target alone. Connecting is an explicit
-verb rather than something that happens silently on every keystroke: it takes
-seconds over SSH, and a person watching a progress bar they asked for is in a
-different mood from one watching a screen freeze.
+The form edits a copy and adopts it on "s" and on nothing else, so backing out
+of a half-finished edit leaves the working target alone. That used to be the
+promise rather than the behaviour: q, Esc and Ctrl-C all saved, and "c" adopted
+the draft the moment it was pressed, which is how an engine switched to have a
+look stayed in the target file.
+
+Connecting is an explicit verb rather than something that happens silently on
+every keystroke: it takes seconds over SSH, and a person watching a progress bar
+they asked for is in a different mood from one watching a screen freeze.
 
 Once the connection is up the interfaces come from the target itself, so ports
 are picked from what is there rather than typed from memory.
@@ -15,13 +19,16 @@ from __future__ import annotations
 import copy
 import os
 
-from traphy import engines, ui
+from traphy import engines
+from traphy import prefs as prefs_mod
+from traphy import ui
 from traphy.engines import ixia
-from traphy.forms import Field, as_int, edit_form
-from traphy.probe import Iface
+from traphy.forms import FORM_EXIT, Field, as_int, edit_form
+from traphy.probe import HostInfo, Iface
 from traphy.session import Session
 from traphy.strings import t
-from traphy.target import LINK_RATES, Target, host_key_known, probe_reachable
+from traphy.target import (LINK_RATES, Target, host_key_known, name_problem,
+                           probe_reachable)
 
 
 # Заголовки групп формы цели. Порядок полей задают сами поля; карта только
@@ -37,6 +44,12 @@ GEN = "ГЕНЕРАТОР НА НЕЙ"
 TX = "ЧЕМ ШЛЁМ"
 RX = "ГДЕ ЛОВИМ - второй порт генератора, между ними устройство под тестом"
 LINE = "ЛИНИЯ"
+
+# Подпись в подвале формы. Своя, а не strings.keys_form: в той нет ни «s», ни
+# того, что «q» отменяет, - а подпись, расходящаяся с поведением, хуже
+# отсутствующей. Именно она и расходилась: обещала «q назад», а черновик
+# сохранялся.
+KEYS = "↑/↓ ↵ править  c связь  t цели  p спросить  s сохранить  q отмена"
 
 SECTIONS = {
     "use_ssh": SEND, "host": SEND, "ssh_user": SEND, "ssh_port": SEND,
@@ -57,8 +70,21 @@ SECTIONS = {
 
 
 def target_screen(session: Session) -> None:
-    """Edit the target, check it, pick its ports. Returns when backed out of."""
+    """Edit the target, check it, pick its ports. Returns when backed out of.
+
+    "s" accepts the draft; q, Esc and Ctrl-C discard it, after asking once when
+    there is something to lose. Which is what the footer says - and the point of
+    the finding behind it: the footer said "q назад" while every exit saved, so
+    an engine switched for a look, or an address typed to see what answered,
+    ended up in the target file.
+    """
     draft = copy.deepcopy(session.target)
+    # С чем сравнивать на выходе (есть ли что терять) и под каким именем
+    # черновик лежит на диске: переименование обязано перенести запись, а не
+    # оставить рядом второй файл про ту же цель.
+    before = copy.deepcopy(session.target)
+    origin = {"name": session.target.name}
+    keep = {"save": False}
     status: dict[str, str] = {"line": ""}
 
     # Наблюдатель один на программу и уже работает - он живёт в сеансе. Пока
@@ -91,23 +117,32 @@ def target_screen(session: Session) -> None:
         выбора не было, каждое переключение означало перенабор адреса,
         логина и обоих интерфейсов, то есть шанс ошибиться в них.
         """
-        names = session.store.list()
+        names = _saved(session)
         if not names:
             return "сохранённых целей нет"
         options = []
         for name in names:
             saved = session.store.try_load(name)
             options.append((name, saved.endpoint() if saved else "не читается"))
+        # Удаление - последней строкой того же списка, а не отдельной клавишей:
+        # это работа с тем же списком, и в подвале, где клавиш уже шесть,
+        # седьмая искалась бы дольше, чем строка в самой выборке.
+        options.append(("удалить сохранённую цель…", "спросит, какую"))
         chosen = ui.choose(t("pick_target"), options,
                            keys_hint=t("keys_pick"), width=ui.WIDE)
         if chosen is None:
             return ""
+        if chosen == len(names):
+            return _delete_saved(session, draft.name)
         saved = session.store.try_load(names[chosen])
         if saved is None:
             return f"цель «{names[chosen]}» не читается"
         # Поля формы смотрят в этот самый объект, поэтому его наполняют, а не
         # подменяют: подмена оставила бы форму показывать прежнюю цель.
         draft.__dict__.update(copy.deepcopy(saved).__dict__)
+        # Теперь черновик лежит на диске под этим именем - переименовывать, если
+        # до него дойдёт, надо именно его запись.
+        origin["name"] = names[chosen]
         session.disconnect()
         status["line"] = ""
         return f"цель: {draft.name} · {draft.endpoint()}"
@@ -128,6 +163,20 @@ def target_screen(session: Session) -> None:
             return "цель уже описывает то, что на машине"
         return "подхвачено — " + "; ".join(changed)
 
+    def save() -> str:
+        """Принять черновик и выйти - единственный путь, которым он сохраняется.
+
+        Имя проверяется здесь, а не при записи: 300 символов в нём - это
+        ``OSError: File name too long`` из файловой системы, панель падения и
+        потерянная форма. Отказ оставляет человека в форме, где всё набранное
+        на месте, а имя - в одном поле от исправления.
+        """
+        problem = name_problem(draft.name)
+        if problem:
+            return f"! {problem}"
+        keep["save"] = True
+        return FORM_EXIT
+
     fields = _fields(session, draft)
     for f in fields:
         f.section = SECTIONS.get(f.key, "")
@@ -135,13 +184,13 @@ def target_screen(session: Session) -> None:
     try:
         edit_form(
             t("form_title"), fields, width=ui.WIDE,
-            keys_hint=t("keys_form"),
+            keys_hint=KEYS,
             # Функцией, а не списком: цель на этом экране меняется - её можно
             # выбрать заново или отредактировать поля, - и шапка, посчитанная
             # один раз при открытии, после этого описывает уже не то, что в форме.
             header=lambda: [ui.c("  " + _summary(session, draft), "dim"),
                             *link_line()],
-            extra_keys={"c": check, "t": pick, "p": adopt},
+            extra_keys={"c": check, "t": pick, "p": adopt, "s": save},
             # Полсекунды: индикатор должен двигаться заметно, но перерисовка
             # чаще этого - работа впустую, проверка всё равно раз в две секунды.
             tick=0.5,
@@ -151,51 +200,133 @@ def target_screen(session: Session) -> None:
         # возвращаем ему цель вместо нашего черновика.
         session.watching = None
 
+    if not keep["save"] and _edited(draft, before):
+        # Терять набранное молча нельзя: вопрос дешевле, чем двадцать полей
+        # заново. Спрашивается только когда есть что терять, иначе «q» из формы,
+        # куда зашли посмотреть, требовало бы второго нажатия.
+        answer = ui.notice([
+            ui.c("  Цель изменена, но не сохранена", "warn"), "",
+            f"  {ui.trim(draft.name + ' · ' + draft.endpoint(), 66)}", "",
+            "  s - сохранить и выйти",
+            ui.c("  любая другая клавиша - выйти, оставив цель как была", "dim"),
+        ], ui.WIDE)
+        if answer == "s":
+            keep["save"] = True
+
+    if not keep["save"]:
+        # Сохранённой цели форма не касалась, восстанавливать нечего. А вот всё,
+        # что узнали про отвергнутый черновик, - открытая связь и названный
+        # отказ - про другую машину, и держать это за выбранной целью нельзя:
+        # «связь есть» про то, что только что отвергли, - то же вранье, от
+        # которого уходили. Черновик, которого не трогали, - та же машина, и
+        # проверенная связь (как и причина отказа) остаётся при ней.
+        #
+        # Пароль остаётся в сеансе при любом исходе: он и вводился «на этот
+        # сеанс», так и написано под полем, и в файл цели не попадает никогда.
+        if _edited(draft, before):
+            session.disconnect()
+        return
+
+    renamed = origin["name"] if origin["name"] != draft.name else ""
+    if renamed and renamed not in _saved(session):
+        renamed = ""          # переносить нечего: под прежним именем записи нет
+    problem = session.remember_target(draft, was=origin["name"])
+
+    lines: list[str] = []
+    if problem:
+        lines += [ui.c("  " + problem, "bad"), ""]
+    if renamed:
+        lines += [ui.c(f"  запись перенесена: {renamed} → {draft.name}", "dim"), ""]
     problems = draft.validate()
     if problems:
-        ui.notice([ui.c(t("problems"), "bad"), ""]
-                  + [ui.c(f"  • {p}", "warn") for p in problems]
-                  + ["", ui.c("  " + t("keys_any"), "dim")], ui.WIDE)
-    session.remember_target(draft)
+        lines += ([ui.c(t("problems"), "bad"), ""]
+                  + [ui.c(f"  • {p}", "warn") for p in problems] + [""])
+    if lines:
+        ui.notice([*lines, ui.c("  " + t("keys_any"), "dim")], ui.WIDE)
+
+
+def _edited(draft: Target, before: Target) -> bool:
+    """Whether the draft has anything in it that leaving would lose.
+
+    Compared through :meth:`Target.to_dict` because that is exactly what a save
+    writes: a field the file does not carry is not something to warn about.
+    """
+    return draft.to_dict() != before.to_dict()
+
+
+def _saved(session: Session) -> list[str]:
+    """Имена сохранённых целей. Чтение каталога может и отказать - пустой список
+    честнее панели падения на экране, который про цели и так всё покажет."""
+    try:
+        return session.store.list()
+    except OSError:
+        return []
+
+
+def _delete_saved(session: Session, draft_name: str = "") -> str:
+    """Убрать одну из сохранённых целей. Возвращает строку состояния.
+
+    Удаления не было нигде: ``TargetStore.delete`` не звал никто, переименование
+    оставляло двойника, а опечатка в имени - третью строку, и разобрать их в
+    выборке было нечем. Спрашивается дважды - какую и точно ли, - потому что
+    файл цели держит адрес, логин и номера портов, которые набирали руками.
+    """
+    names = _saved(session)
+    if not names:
+        return "сохранённых целей нет"
+    options = []
+    for name in names:
+        saved = session.store.try_load(name)
+        options.append((name, saved.endpoint() if saved else "не читается"))
+    chosen = ui.choose("Какую цель удалить?", options,
+                       keys_hint=t("keys_pick"), width=ui.WIDE)
+    if chosen is None:
+        return ""
+    name = names[chosen]
+    answer = ui.notice([
+        ui.c(f"  Удалить сохранённую цель «{name}»?", "warn"), "",
+        "  Файл цели будет удалён. Пароля в нём нет, а адрес, логин и",
+        "  номера портов придётся набрать заново.", "",
+        "  y - удалить",
+        ui.c("  любая другая клавиша - оставить", "dim"),
+    ], ui.WIDE)
+    if answer != "y":
+        return "цель оставлена"
+    try:
+        session.store.delete(name)
+    except OSError as exc:
+        return f"! «{name}» не удалена: {exc.strerror or exc}"
+    if name == draft_name:
+        # Черновик в форме не трогаем: он набран, и «s» запишет его заново - в
+        # том числе под этим же именем, если человек именно того и хотел.
+        return f"цель «{name}» удалена - в форме она осталась черновиком"
+    return f"цель «{name}» удалена"
 
 
 def _summary(session: Session, draft: Target) -> str:
-    """The line under the form title: where this goes and what answered."""
+    """The line under the form title: where this goes and what answered.
+
+    What counts as "what answered" is the engine's to say. Branching on the
+    engine key here put JMeter - L7, no NIC, no frames - into the Scapy arm and
+    had it report a scapy version as if that were the thing missing.
+    """
     if session.host and session.host.ok:
         info = session.host
         head = f"{info.hostname} · {info.kernel} · python {info.python}"
-        if engines.get(draft.engine).uses_ifaces:
-            return head + " · " + (f"scapy {info.scapy_version}"
-                                   if info.has_scapy else "без scapy")
-        if draft.engine == "ixia":
-            return head + " · " + _ixia_summary(info)
-        return head + " · " + _trex_summary(info)
+        said = engines.get(draft.engine).describe_host(info)
+        return f"{head} · {said}" if said else head
     return draft.endpoint()
-
-
-def _ixia_summary(info) -> str:
-    """Only one thing has to be here; the chassis is checked by the run."""
-    if not info.has_ixnetwork:
-        return "нет ixnetwork-restpy"
-    version = f" {info.ixnetwork_version}" if info.ixnetwork_version else ""
-    return f"ixnetwork-restpy{version}"
-
-
-def _trex_summary(info) -> str:
-    """What the target has of TRex, in the order it has to be fixed."""
-    if not info.has_trex:
-        return "TRex не найден"
-    where = info.trex_dir or "TRex"
-    version = f" {info.trex_version}" if info.trex_version else ""
-    if not info.has_trex_stl:
-        return f"{where}{version} - без control plane"
-    return f"TRex{version} в {where} · " + ("демон отвечает" if info.trex_daemon
-                                            else "демон не поднят")
 
 
 def _fields(session: Session, d: Target) -> list[Field]:
     """The target form. Setters validate and return a reason on refusal."""
     def name_set(v: str) -> str:
+        """Имя цели - это ещё и имя её файла, поэтому отказ здесь, а не при
+        записи: иначе длинное имя доходит до ``open()`` и возвращается панелью
+        падения, вместе с которой теряется вся форма."""
+        problem = name_problem(v)
+        if problem:
+            return f"! {problem}"
         d.name = v.strip()
         return ""
 
@@ -395,6 +526,9 @@ def _fields(session: Session, d: Target) -> list[Field]:
 
     remote = lambda: d.use_ssh
     by_iface = lambda: engines.get(d.engine).uses_ifaces
+    # Не то же, что by_iface: JMeter работает по сети, но сырой сокет не
+    # открывает никогда, а поле sudo с подсказкой про него стояло и у него.
+    by_raw_socket = lambda: engines.get(d.engine).opens_raw_socket
     by_trex = lambda: d.engine == "trex"
     by_ixia = lambda: d.engine == "ixia"
 
@@ -404,11 +538,12 @@ def _fields(session: Session, d: Target) -> list[Field]:
         engine = engines.get(v)
         return "" if engine.ready else f"! {engine.title} {engine.status}"
 
-    return [
+    out = [
         Field("name", t("f_name"), lambda: d.name, name_set),
+        # Без подсказки: она пересказывала options() и устарела, как только TRex
+        # и Ixia стали готовы. Там же это посчитано по каждому пункту отдельно.
         Field("engine", t("f_engine"), lambda: _engine_label(d), engine_set,
-              kind="pick", options=engines.options(),
-              hint="Scapy - L2-L4 своими кадрами; остальные пока заявлены"),
+              kind="pick", options=engines.options()),
         # Два названных варианта вместо «да/нет»: вопрос тут не «включить SSH»,
         # а «откуда уходят кадры», и ответ «нет» на него не отвечает.
         Field("use_ssh", t("f_use_ssh"),
@@ -445,7 +580,7 @@ def _fields(session: Session, d: Target) -> list[Field]:
               lambda v: (setattr(d, "python", v.strip() or "python3"), "")[1],
               suggest=("python3", "python3.11", "python3.9")),
         Field("sudo", t("f_sudo"), lambda: _yn(d.use_sudo), sudo_toggle,
-              kind="toggle", visible=by_iface,
+              kind="toggle", visible=by_raw_socket,
               hint="сырой сокет без root не открыть"),
         Field("tx", t("f_tx"), lambda: _iface_label(session, d.tx_iface),
               iface_set("tx"), visible=by_iface, raw=lambda: d.tx_iface,
@@ -511,6 +646,16 @@ def _fields(session: Session, d: Target) -> list[Field]:
               kind="pick", options=rate_options(),
               hint="нужно только чтобы посчитать «% от линии»"),
     ]
+    # Адреса, логины и пути стенда память полей не держит - тем же флагом, каким
+    # это уже сделано для пароля. Список прошлых значений виден на экране при
+    # правке поля, то есть снимок формы выносил наружу перечень машин; а смысла
+    # в этой памяти тут нет - адрес хранит сама цель, и между машинами
+    # переключаются выборкой «t». Какие это поля, знает prefs: он же выметает со
+    # старта то, что успела запомнить прежняя версия.
+    for f in out:
+        if f.key in prefs_mod.NEVER_REMEMBERED:
+            f.remember = False
+    return out
 
 
 def _engine_label(d: Target) -> str:
@@ -575,7 +720,9 @@ def _connect_with_progress(session: Session, draft: Target) -> str:
     if problems:
         return "! " + problems[0]
 
-    session.target = draft
+    # Черновик тут не принимается: опрос - это вопрос «отвечает ли эта машина», а
+    # не «эту цель и берём». Пока он присваивался сеансу, «c» принимал черновик
+    # по нажатию, и выход по «q» уже ничего не отменял.
     if not draft.is_local and draft.host_key == "strict" and not host_key_known(
             draft.host, draft.ssh_port):
         answer = ui.notice([
@@ -591,11 +738,16 @@ def _connect_with_progress(session: Session, draft: Target) -> str:
     _progress(draft, 0.1, "открываю соединение")
     reachable, why = probe_reachable(draft, on_progress=None)
     if not reachable:
-        session.host = None
+        # Закрыть за собой и записать, почему: прежний сокет мог остаться
+        # открытым (адрес тот же, коробка уехала), а молчаливое host = None
+        # оставляло на главном экране «связь не проверена» - вместо «не
+        # отвечает», которое тут только что и выяснили.
+        session.disconnect()
+        session.host = HostInfo(ok=False, error=why)
         return f"! {why}"
 
     _progress(draft, 0.5, "опрашиваю цель")
-    ok, message = session.connect()
+    ok, message = session.connect(draft)
     if not ok:
         return f"! {message}"
 
@@ -606,7 +758,11 @@ def _connect_with_progress(session: Session, draft: Target) -> str:
     # передавался, в меню нет.
     blockers = session.host.blockers(draft.engine) if session.host else []
     if blockers:
-        return "! " + blockers[0]
+        # Не только сказать, но и закрыть за собой: пока связь оставалась
+        # открытой, а host.ok - истиной, главный экран показывал «✓ связь есть» и
+        # отпирал «Запустить» по уже названному отказу, и прогон умирал той же
+        # фразой, которую экран к этому моменту знал.
+        return "! " + session.refuse(blockers[0])
     return message
 
 

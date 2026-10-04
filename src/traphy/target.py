@@ -17,6 +17,7 @@ life of the run and never persisted.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -29,6 +30,36 @@ from typing import Any
 # used to turn "50% of the line" into a pps number; it does not constrain what
 # the NIC does.
 LINK_RATES = (100, 1000, 10000, 25000, 40000, 100000)
+
+# How long a target name may be. The limit is the filesystem's, not taste: a
+# name becomes a file name (see :meth:`TargetStore.path_for`), and most of them
+# stop at 255 bytes - where a Cyrillic character costs two. Sixty-four is well
+# inside that on any encoding and still longer than anything a person types.
+NAME_MAX = 64
+
+
+def name_problem(name: str) -> str:
+    """Why this target name cannot be stored, or empty when it can.
+
+    One rule in one place because two callers need the same answer: the form
+    refuses the value as it is typed, and :meth:`Target.validate` refuses a
+    target that arrived from a file. Checking only at write time meant 300
+    characters in the name field reached ``open()`` and came back as
+    ``OSError: File name too long`` - a crash panel, with the whole form lost.
+    """
+    text = name.strip()
+    if not text:
+        return "у цели пустое имя"
+    if len(text) > NAME_MAX:
+        return f"имя цели длиннее {NAME_MAX} символов - файл с таким не создать"
+    if any(ch in text for ch in "/\\") or any(ord(ch) < 32 for ch in text):
+        # Эти символы не отвергаются, а молча заменяются на «_» при записи -
+        # то есть «a/b» и «a_b» становятся одним файлом, и человек правит не ту
+        # цель. Лучше отказ на вводе, чем совпадение задним числом.
+        return "в имени цели нельзя / \\ и управляющие символы"
+    if not any(ch.isalnum() or ch in "-_" for ch in text):
+        return "в имени цели нет ни буквы, ни цифры - записывать его некуда"
+    return ""
 
 
 @dataclass
@@ -186,6 +217,17 @@ class Target:
         port = f":{self.ssh_port}" if self.ssh_port != 22 else ""
         return f"{user}{self.host}{port} · {where}"
 
+    def link_subject(self) -> str:
+        """Which address the live check is about, as a label for its reading.
+
+        Exactly what :func:`probe_reachable` touches and nothing else: the
+        reading is stamped with this and dropped when it no longer matches, so
+        an answer from the previous address cannot be shown as an answer from
+        the one now in the field. The engine and the port names are left out on
+        purpose - changing those says nothing about whether the box replies.
+        """
+        return f"{self.host}:{self.ssh_port}"
+
     def _uses_ifaces(self) -> bool:
         from traphy import engines
 
@@ -263,8 +305,9 @@ class Target:
 
     def validate(self) -> list[str]:
         problems: list[str] = []
-        if not self.name.strip():
-            problems.append("у цели пустое имя")
+        problem = name_problem(self.name)
+        if problem:
+            problems.append(problem)
         if self.use_ssh and not self.host.strip():
             problems.append("SSH включён, но адрес не задан")
         if self.use_ssh and not self.ssh_user.strip():
@@ -321,12 +364,25 @@ class TargetStore:
 
     def save(self, target: Target) -> Path:
         """Write a target out atomically, so an interrupted save keeps the old
-        one rather than leaving half a file the next start has to discard."""
+        one rather than leaving half a file the next start has to discard.
+
+        An OSError still comes out of here - a name the filesystem refuses is a
+        thing a person typed, and whoever asked for the write decides how to
+        say so - but the temporary file goes first, so a refused save does not
+        leave a half-written sibling for the next start to trip over.
+        """
         self._ensure()
         path = self.path_for(target.name)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(target.to_json() + "\n", encoding="utf-8")
-        tmp.replace(path)
+        try:
+            tmp.write_text(target.to_json() + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            # Уборка не имеет права заслонить первую ошибку: интересна она, а
+            # не то, что имя оказалось слишком длинным и для unlink тоже.
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
         return path
 
     def load(self, name: str) -> Target:

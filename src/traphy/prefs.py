@@ -32,6 +32,31 @@ MAX_RECENT = 5
 LANGS = ("ru", "en")
 THEMES = ("dark", "light")
 
+# Поля, значения которых не запоминаются вовсе. Это ключи полей формы цели, и
+# всё, что в них вводят, - инвентарь стенда: адрес машины, логин, путь к ключу
+# (а в нём ещё и домашний каталог), адрес демона, адрес шасси и API-сервера.
+#
+# Почему решено не запоминать, а не «дать способ забыть»: список прошлых значений
+# показывается на экране при правке поля («вводилось раньше»), то есть снимок
+# формы выносит наружу перечень машин - и выносит тем вернее, чем аккуратнее
+# человек работал. Забывать пришлось бы вручную и до скриншота, а не после.
+# Собственного смысла у этой памяти тут нет: адрес и логин хранит сама цель, и
+# между машинами переключаются выбором цели, а не перенабором адреса. Для пароля
+# это уже сделано одним флагом remember=False - здесь то же решение.
+#
+# Две точки исполнения: форма цели снимает с этих полей remember (см.
+# traphy.screens.connect._fields), а :func:`forget_values` на старте выметает то,
+# что успела записать прежняя версия - иначе уже записанное жило бы на экране
+# дальше, и «мы это больше не храним» было бы правдой только для новых значений.
+NEVER_REMEMBERED = ("host", "ssh_user", "ssh_key", "trex_server",
+                    "ixia_api", "ixia_user", "ixia_chassis",
+                    # Адреса кадра - это инвентарь устройства под тестом, а не
+                    # удобство: MAC коробки и адреса её плеч запоминались так же
+                    # охотно, как адрес генератора, и так же показывались на
+                    # экране списком «вводилось раньше». Концы диапазона (min,
+                    # max) туда же - это те же адреса, только парой.
+                    "eth_src", "eth_dst", "ip_src", "ip_dst", "min", "max")
+
 _DEFAULTS: dict[str, Any] = {
     "lang": "ru",
     "theme": "dark",
@@ -115,6 +140,10 @@ def remember_value(prefs: dict[str, Any], key: str, value: str) -> dict[str, Any
 
     Re-entering a value moves it up rather than duplicating it: the list is
     "what you use", and a value used twice is more likely, not less.
+
+    Which fields get here at all is the form's call - see :data:`NEVER_REMEMBERED`
+    and ``Field.remember``. This end stays a plain list, so there is one place
+    that decides and one that stores.
     """
     value = (value or "").strip()
     if not key or not value:
@@ -125,6 +154,23 @@ def remember_value(prefs: dict[str, Any], key: str, value: str) -> dict[str, Any
     recent[key] = values[:MAX_RECENT]
     prefs["recent"] = recent
     return prefs
+
+
+def forget_values(prefs: dict[str, Any], *keys: str) -> bool:
+    """Drop what was entered into these fields. True when something was there.
+
+    The return value is what tells the caller whether the state file needs
+    rewriting: sweeping on every start-up must not rewrite the file every
+    start-up, or "nothing changed" stops being visible in its timestamp.
+
+    With no keys given it forgets every field - the whole "entered before"
+    memory, which is the one request that cannot be served by editing a list.
+    """
+    recent = _clean_recent(prefs.get("recent"))
+    wanted = set(keys) if keys else set(recent)
+    dropped = {key: values for key, values in recent.items() if key not in wanted}
+    prefs["recent"] = dropped
+    return len(dropped) != len(recent)
 
 
 def save_prefs(prefs: dict[str, Any]) -> bool:

@@ -41,6 +41,10 @@ class Row:
     action: Callable[[Session], None] | None = None
     needs_link: bool = False        # locked until the target answered
     needs_traffic: bool = False     # locked until something is composed
+    # Заперто, пока выбранный движок объявлен, но не реализован. Без этого
+    # признака замок был только на связи, и «Запустить» на цели с JMeter
+    # сообщал «сначала проверь связь с целью» - про то, что вообще ни при чём.
+    needs_engine: bool = False
     cycles: bool = False            # a preference row, not a screen
     # Заголовок раздела. Печатается перед первой строкой раздела и сам строкой
     # не является: по нему не встать курсором и нечего открыть.
@@ -80,13 +84,17 @@ ROWS: tuple[Row, ...] = (
     Row("compose", _compose, section="sec_what"),
     Row("streams", compose_screens.streams_screen, needs_traffic=True,
         section="sec_what"),
+    # Скрипт, сохранение и прогон - всё, что просит у движка артефакт. У
+    # нереализованного его нет, и отказ в середине нажатия хуже замка: он
+    # приходит после того, как человек уже решил, что делает.
     Row("script", execute_screens.script_screen, needs_traffic=True,
+        needs_engine=True, section="sec_what"),
+    Row("save", _save, needs_traffic=True, needs_engine=True,
         section="sec_what"),
-    Row("save", _save, needs_traffic=True, section="sec_what"),
 
-    Row("dry", _dry, needs_traffic=True, section="sec_run"),
+    Row("dry", _dry, needs_traffic=True, needs_engine=True, section="sec_run"),
     Row("run", execute_screens.run_screen, needs_link=True, needs_traffic=True,
-        section="sec_run"),
+        needs_engine=True, section="sec_run"),
     Row("history", execute_screens.history_screen, section="sec_run"),
 
     Row("lang", cycles=True, section="sec_view"),
@@ -94,13 +102,42 @@ ROWS: tuple[Row, ...] = (
 )
 
 
+def _lock(row: Row, session: Session) -> tuple[str, str]:
+    """(почему строка заперта, в какой строке меню замок снимается).
+
+    Порядок - это порядок разбирательства. Нереализованный движок идёт первым:
+    пока цель слать не умеет, ни собранный трафик, ни связь ничего не меняют, а
+    «сначала проверь связь с целью» на цели с JMeter посылает проверять то, что
+    ни при чём, - и связь при этом может быть прекрасной.
+    """
+    if row.needs_engine:
+        from traphy import engines
+
+        engine = engines.get(session.target.engine)
+        if not engine.ready:
+            return f"{engine.title}: {t('engine_locked')}", "setup"
+    if row.needs_traffic and session.profile is None:
+        return t("no_profile"), "compose"
+    if row.needs_link and not session.connected:
+        return t("locked"), "setup"
+    return "", ""
+
+
 def locked_reason(row: Row, session: Session) -> str:
     """Why this row cannot be used yet, or empty when it can."""
-    if row.needs_traffic and session.profile is None:
-        return t("no_profile")
-    if row.needs_link and not session.connected:
-        return t("locked")
-    return ""
+    return _lock(row, session)[0]
+
+
+def unlock_row(row: Row, session: Session) -> Row | None:
+    """The launcher row where this row's lock is lifted, or None.
+
+    A padlock saying "check the target first" names an action, not the screen
+    that has it: "c" lives inside the target form and there is no such key out
+    here. So the panel points at the row to open, and the operator is not left
+    looking for a key the screen does not have.
+    """
+    where = _lock(row, session)[1]
+    return next((r for r in ROWS if r.key == where), None)
 
 
 def run(version: str = "0.0.0", profile_dir: Path | None = None) -> int:
@@ -157,8 +194,12 @@ def _activate(row: Row, session: Session) -> None:
         return
     reason = locked_reason(row, session)
     if reason:
-        ui.notice([ui.c(f"  {row.title()} - {reason}", "warn"), "",
-                   ui.c("  " + t("keys_any"), "dim")], ui.WIDE)
+        lines = [ui.c(f"  {row.title()} - {reason}", "warn"), ""]
+        where = unlock_row(row, session)
+        if where:
+            lines += [ui.c(f"  → {where.title()} - {where.hint()}", "title"), ""]
+        lines.append(ui.c("  " + t("keys_any"), "dim"))
+        ui.notice(lines, ui.WIDE)
         return
     if row.action:
         row.action(session)
@@ -208,7 +249,7 @@ def _render(session: Session, cursor: int) -> str:
         lines.append(_row_line(row, session, selected=i == cursor))
 
     lines.append("")
-    lines.append(ui.c("  " + t("keys_main"), "dim"))
+    lines.extend(ui.hint_rows(t("keys_main"), ui.WIDTH))
     return ui.panel(lines, ui.WIDTH)
 
 
@@ -228,8 +269,17 @@ def _profile_line(session: Session) -> str:
     pps = f"{profile.total_pps(session.target.link_mbit):,.0f}".replace(",", " ")
     # Через словарь, как и всё остальное на этом экране: собранная здесь строка
     # оставалась русской при английском языке, и шапка выглядела полупереведённой.
-    return t("profile_line", name=profile.name, on=enabled,
+    line = t("profile_line", name=profile.name, on=enabled,
              all=len(profile.streams), pps=pps)
+    # Куда пойдёт трафик - на главном экране, а не только внутри потока. Джун,
+    # настроивший перебор адресов, не мог отсюда убедиться, что собрал верно, и
+    # каждый раз лазил внутрь. Адрес важнее скорости: ошибка в нём дороже.
+    where = compose_screens.destination(profile)
+    if where:
+        line = f"{line} · {ui.trim(where, 28)}"
+    # И признак того, что собранное живёт только в памяти. С виду правишь файл.
+    unsaved = compose_screens.unsaved_note(session)
+    return f"{line} · {unsaved}" if unsaved else line
 
 
 def _row_line(row: Row, session: Session, selected: bool) -> str:

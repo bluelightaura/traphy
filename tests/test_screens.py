@@ -15,16 +15,18 @@ from __future__ import annotations
 
 import pytest
 
-from traphy import forms, menu, presets, ui
+from traphy import engines, forms, menu, presets, ui
 from traphy.runner import RunResult
 from traphy.forms import Field
-from traphy.screens import compose, connect
+from traphy.models import RateType
+from traphy.screens import compose, connect, execute
 from traphy.session import Session
 from traphy.target import Target
 
 ENGINES = ("scapy", "trex", "ixia")
 SOURCES = ("flow_stats", "flow_stats_blind", "flow_stats_unverified",
-           "port_counter", "mixed", "partial", "marker", "none")
+           "flow_stats_tainted", "port_counter", "mixed", "partial", "marker",
+           "none")
 
 
 @pytest.fixture
@@ -100,8 +102,10 @@ def test_a_local_target_hides_what_only_makes_sense_over_ssh(session):
 # --------------------------------------------------------------------------- #
 def test_the_packet_and_rate_forms_draw(session):
     stream = session.profile.streams[0]
+    engine = engines.get(session.target.engine)
     for title, fields in (("Кадр", compose.packet_fields(stream)),
-                          ("Скорость", compose.rate_fields(stream))):
+                          ("Скорость", compose.rate_fields(
+                              stream, engine, session.target.link_mbit))):
         rows = [f for f in fields if f.shown()]
         assert rows
         framed(forms._render(title, rows, 0, "", ui.WIDE, None, "", 26))
@@ -238,3 +242,180 @@ def test_a_long_hint_wraps_instead_of_losing_its_warning():
     at = next(i for i, f in enumerate(rows) if f.key == "eth_dst")
     out = framed(forms._render("Кадр", rows, at, "", ui.WIDE, None, "", 26))
     assert any("приём будет нулевой" in ln for ln in out)
+
+
+# --------------------------------------------------------------------------- #
+# Скорость: чьими словами она объясняется и от какой линии считается
+# --------------------------------------------------------------------------- #
+def _hint(field: Field) -> str:
+    """Подсказка поля строкой: она бывает и функцией."""
+    return field.hint() if callable(field.hint) else field.hint
+
+
+def _under_the_rate(stream, engine, link_mbit: int, typed: str) -> str:
+    """Всё, что форма говорит под полем скорости: подсказка и ответ на ввод."""
+    field = next(f for f in compose.rate_fields(stream, engine, link_mbit)
+                 if f.key == "rate")
+    return f"{_hint(field)}\n{field.set(typed)}"
+
+
+def _one_number(text: str) -> str:
+    """Тот же текст со склеенными разрядами: «10 279 605» → «10279605»."""
+    import re
+
+    return re.sub(r"(?<=\d)[\s  ,](?=\d)", "", text)
+
+
+@pytest.mark.parametrize("key", list(engines.REGISTRY))
+def test_the_rate_field_names_no_engine_but_the_one_that_will_send(key):
+    """Найдено живым проходом 2026-10-01: на цели с TRex под скоростью стояло
+    «Scapy это цель, а не гарантия». Совет про чужой путь читается как про этот
+    и заставляет занижать скорость там, где её держит железо."""
+    engine = engines.REGISTRY[key]
+    stream = presets.build("l3_ip").streams[0]
+    said = _under_the_rate(stream, engine, 25000, "500000").lower()
+    strangers = [other.title for other_key, other in engines.REGISTRY.items()
+                 if other_key != key]
+    named = [title for title in strangers if title.lower() in said]
+    assert not named, f"цель с {engine.title}: под скоростью назван {named}"
+
+
+def test_a_percent_of_the_line_is_counted_against_the_targets_link():
+    """Найдено живым проходом 2026-10-01: «50% линии» на цели 25G считались от
+    зашитого гигабита. Форма обещала 411 тысяч pps там, где поток выдаёт десять
+    миллионов - то есть цифру, по которой решают «хватит ли», занижало в 25 раз.
+    """
+    engine = engines.REGISTRY["scapy"]
+    stream = presets.build("l3_ip").streams[0]
+    stream.rate_type = RateType.PERCENT
+
+    on_25g = _under_the_rate(stream, engine, 25000, "50")
+    on_1g = _under_the_rate(stream, engine, 1000, "50")
+    assert on_25g != on_1g, "скорость линии цели на счёт не влияет"
+    assert str(round(stream.pps(25000))) in _one_number(on_25g), \
+        f"не цифра 25 Гбит/с: {on_25g}"
+    assert str(round(stream.pps(1000))) not in _one_number(on_25g), \
+        "посчитано от зашитого гигабита"
+
+
+# --------------------------------------------------------------------------- #
+# Шапка экрана и поля под ней
+# --------------------------------------------------------------------------- #
+HEADER_SCREENS = ("_ask_fields", "_ask_rate", "_edit_range", "stream_editor")
+
+
+@pytest.fixture
+def opened_form(monkeypatch):
+    """Чем экран позвал форму, вместо того чтобы её открыть."""
+    seen: list[dict] = []
+
+    def instead(title, fields, **kw):
+        seen.append(kw)
+
+    monkeypatch.setattr(compose, "edit_form", instead)
+    return seen
+
+
+def _header_now(header) -> list[str]:
+    """Шапка, посчитанная сейчас, а не когда-то."""
+    lines = header() if callable(header) else list(header)
+    return framed("\n".join(lines))
+
+
+def _open_screen(func, **available):
+    """Позвать экран, подставив по имени только то, что он просит.
+
+    Экраны берут разное - шаг мастера, диапазон, движок цели, - а тест смотрит
+    на одно: с какой шапкой каждый из них открыл форму.
+    """
+    import inspect
+
+    params = inspect.signature(func).parameters
+    missing = [name for name, p in params.items()
+               if p.default is p.empty and name not in available]
+    assert not missing, f"{func.__name__} просит {missing} - допиши в тест"
+    return func(**{k: v for k, v in available.items() if k in params})
+
+
+@pytest.mark.parametrize("screen", HEADER_SCREENS)
+def test_the_header_says_what_the_fields_under_it_say_now(screen, opened_form):
+    """Этот дефект уже был на форме цели, и там его починили лямбдой - а в
+    четырёх экранах сборки шапка по-прежнему считается один раз при открытии.
+    Правишь размер кадра и скорость, а над полями до самого выхода стоит
+    прежнее «Eth/IP 128B, 1000 pps»: это читается как «правка не взялась»."""
+    stream = presets.build("port_sweep").streams[0]
+    _open_screen(getattr(compose, screen), stream=stream, step=1,
+                 vf=stream.vm_fields[0], engine=engines.REGISTRY["trex"],
+                 link_mbit=25000, title="")
+    header = opened_form[0]["header"]
+
+    before = _header_now(header)
+    stream.packet.frame_size = 60
+    stream.rate_value = 10_000
+    assert _header_now(header) != before, "шапка осталась от прежних значений"
+
+
+# --------------------------------------------------------------------------- #
+# Предпросмотр, сохранение и предупреждения движка
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def trex_session(session, tmp_path) -> Session:
+    """Сеанс с целью на TRex. Все параметры выдуманные - стенда тут нет."""
+    session.target = Target(name="генератор", engine="trex",
+                            trex_port_tx=0, trex_port_rx=1, link_mbit=25000)
+    session.script_dir = tmp_path / "scripts"
+    return session
+
+
+def _drawn(monkeypatch, call) -> str:
+    """Кадр, который экран нарисовал: один проход и сразу выход."""
+    frames: list[str] = []
+    keys = iter(["q"])
+    monkeypatch.setattr(ui, "draw", frames.append)
+    monkeypatch.setattr(ui, "read_key", lambda timeout=None: next(keys))
+    call()
+    return "\n".join(framed("\n".join(frames)))
+
+
+def test_the_script_screen_shows_the_artefact_of_the_engine_that_will_send(
+        trex_session, monkeypatch):
+    """Найдено живым проходом 2026-10-01: на цели с TRex «показать скрипт»
+    печатал скрипт Scapy, хотя уезжает и исполняется управляющий скрипт TRex.
+    Предпросмотр, показывающий не то, что уедет, хуже отсутствующего: его
+    читают вместо чтения настоящего файла."""
+    page = _drawn(monkeypatch, lambda: execute.script_screen(trex_session))
+    assert "--trex-dir" in page, "это не управляющий скрипт TRex"
+    assert "--iface eth0" not in page, "показан скрипт Scapy"
+
+
+def test_saving_the_script_writes_and_names_what_the_engine_produces(
+        trex_session, monkeypatch):
+    """То же расхождение на выходе: сохранялся скрипт Scapy под именем от
+    генератора Scapy - и на цели запускали заведомо не тот файл."""
+    # Имя артефакта у Scapy и TRex сейчас совпадает, поэтому движок называет
+    # его по-своему: иначе проверка прошла бы и на чужом генераторе.
+    monkeypatch.setattr(engines.REGISTRY["trex"], "script_name",
+                        lambda profile: "поток_для_trex.py", raising=False)
+    monkeypatch.setattr(ui, "ask_line", lambda *a, **kw: "")
+
+    status = execute.save_script(trex_session)
+    saved = trex_session.script_dir / "поток_для_trex.py"
+    assert saved.exists(), f"сохранено не туда: {status}"
+    text = saved.read_text(encoding="utf-8")
+    assert "--trex-dir" in text, "записан не артефакт TRex"
+    assert "--iface eth0" not in text, "записан скрипт Scapy"
+
+
+def test_the_streams_screen_passes_on_what_the_engine_warns_about(session):
+    """Найдено живым проходом 2026-10-01: TRex метит группы полем IP ID, то есть
+    потери по кадру без IP не посчитает. Движок про это говорит, а экран его не
+    спрашивал - и человек, взявший L2-пресет, узнавал об этом из нулевой строки
+    приёма в отчёте, то есть когда прогон уже сделан."""
+    session.target = Target(name="генератор", engine="trex")
+    session.profile = presets.build("l2_ethernet")
+    expected = engines.REGISTRY["trex"].warnings(session.profile)
+    assert expected, "кадр без IP обязан вызвать предупреждение движка"
+
+    lines = framed(compose._render_streams(session, session.profile, 0, ""))
+    head = expected[0][:30]
+    assert any(head in line for line in lines), f"не сказано: {expected[0]}"

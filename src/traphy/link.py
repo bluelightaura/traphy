@@ -44,12 +44,17 @@ Check = Callable[[], tuple[bool, str]]
 
 @dataclass(frozen=True)
 class Reading:
-    """Одна проверка: получилось ли, за сколько, и когда это было."""
+    """Одна проверка: получилось ли, за сколько, когда и про кого."""
 
     ok: bool
     ms: float = 0.0
     at: float = 0.0
     error: str = ""
+    # Про кого это показание. Без него оно наследовалось: меняешь адрес в форме
+    # на заведомо мёртвый - и ещё три секунды горит зелёное «отвечает · 0 мс»,
+    # потому что ответил прежний объект наблюдения. По часам показание при этом
+    # свежее, то есть оговоркой про возраст такое не ловится.
+    about: str = ""
 
 
 class Watch:
@@ -57,13 +62,19 @@ class Watch:
 
     Проверка передаётся снаружи и берётся заново на каждом круге, поэтому
     правка адреса в форме подхватывается без перезапуска наблюдателя.
+
+    ``subject`` говорит, про кого спрашивают сейчас. Этим помечается каждое
+    показание, и показание, снятое с другого адреса, не выдаётся за ответ
+    нового: правка адреса обнуляет индикатор, а не перекрашивает его.
     """
 
     def __init__(self, check: Check, every: float = EVERY_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 subject: Callable[[], str] | None = None):
         self.check = check
         self.every = every
         self.clock = clock
+        self.subject = subject
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -97,6 +108,9 @@ class Watch:
     def measure(self) -> Reading:
         """Одна проверка. Отдельным методом, чтобы её можно было позвать без
         потока - в тесте и при первом открытии экрана."""
+        # До проверки, а не после: отвечает тот, кого спросили. Правка адреса
+        # посреди круга не имеет права записать ответ прежней машины на новый.
+        about = self._about()
         started = self.clock()
         try:
             ok, why = self.check()
@@ -105,7 +119,7 @@ class Watch:
             # человек лишается интерфейса из-за того, что сеть моргнула.
             ok, why = False, str(exc) or exc.__class__.__name__
         reading = Reading(ok=ok, ms=(self.clock() - started) * 1000.0,
-                          at=self.clock(), error="" if ok else why)
+                          at=self.clock(), error="" if ok else why, about=about)
         with self._lock:
             self._latest = reading
             self._count += 1
@@ -121,17 +135,40 @@ class Watch:
         with self._lock:
             return self._count
 
+    def _about(self) -> str:
+        """Про кого спрашиваем сейчас, или пусто, если спрашивающему всё равно.
+
+        Падение тут запрещено по той же причине, что и в самой проверке: это
+        зовётся из рисующего цикла, и экран не должен исчезать из-за того, что
+        у цели в этот момент меняли поле.
+        """
+        if self.subject is None:
+            return ""
+        try:
+            return self.subject()
+        except Exception:
+            return ""
+
     def line(self) -> tuple[str, str]:
         """(текст, роль цвета) для шапки экрана."""
+        about = self._about()
         with self._lock:
-            return describe(self._latest, self._count, self.every, self.clock())
+            return describe(self._latest, self._count, self.every,
+                            self.clock(), about)
 
 
 def describe(reading: Reading | None, count: int = 0, every: float = EVERY_S,
-             now: float = 0.0) -> tuple[str, str]:
-    """Как показать последнее показание. Чистая функция - её и проверяют."""
+             now: float = 0.0, about: str = "") -> tuple[str, str]:
+    """Как показать последнее показание. Чистая функция - её и проверяют.
+
+    ``about`` - про кого спрашивают сейчас. Показание про другой адрес не
+    «устарело», оно чужое: ни возрастом, ни оговоркой это не спасти, поэтому
+    индикатор возвращается в «не проверено» до первого ответа нового адреса.
+    """
     if reading is None:
         return "◌ проверяю связь…", "dim"
+    if reading.about != about:
+        return "◌ не проверено", "dim"
     pulse = PULSE[count % len(PULSE)]
     age = max(0.0, now - reading.at)
     stale = age > every * STALE_AFTER

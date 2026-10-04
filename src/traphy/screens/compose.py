@@ -14,6 +14,7 @@ answered, and the stream editor reopens any of them afterwards.
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 from traphy import engines, presets, ui
 from traphy.forms import (
@@ -71,10 +72,16 @@ def compose_screen(session: Session) -> Profile | None:
     if picked is None:
         return None
     if picked == 0:
-        return preset_screen()
-    if picked == 1:
-        return wizard(session)
-    return load_screen(session)
+        profile = preset_screen()
+    elif picked == 1:
+        profile = wizard(session)
+    else:
+        profile = load_screen(session)
+    if profile is None:
+        return None
+    # Сторож стоит здесь, а не на сохранении: сохраняет вызывающий, сразу же
+    # после возврата, и к тому моменту спрашивать уже не у кого.
+    return _unless_it_overwrites(session, profile)
 
 
 def preset_screen() -> Profile | None:
@@ -117,23 +124,195 @@ def _peek(path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Чужая работа под тем же именем
+# --------------------------------------------------------------------------- #
+def _unless_it_overwrites(session: Session, profile: Profile) -> Profile | None:
+    """The composed profile, once it is clear it lands on nobody else's file.
+
+    What the caller does with what this screen returns is save it, under a name
+    computed from the profile - fixed for a preset, deterministic for the
+    wizard - so the names collide as a matter of course. A second look at a
+    preset used to overwrite a profile tuned by hand before the stream screen
+    was even drawn, with neither a question nor the file name anywhere on the
+    screen. It is asked here because this is the last moment there is anyone to
+    ask: one return later the file is already written.
+    """
+    while True:
+        path = session.profile_path(profile.name)
+        if not _would_overwrite(path, profile):
+            return profile
+        answer = ui.notice(_overwrite_panel(path, profile), ui.WIDE)
+        if answer in ("y", "д"):
+            return profile
+        if answer not in ("n", "н"):
+            # Любая другая клавиша - отмена, и отмена здесь значит «ничего не
+            # сохранено»: на экране стоял вопрос про чужой файл.
+            return None
+        renamed = ui.ask_line("новое имя профиля (Enter - отмена): ").strip()
+        if not renamed:
+            return None
+        profile.name = renamed
+
+
+def _overwrite_panel(path: Path, profile: Profile) -> list[str]:
+    """Что именно потеряется, с именем файла - его и не хватало."""
+    room = ui.WIDE - 16
+    return [
+        ui.c(f"  Профиль «{profile.name}» уже сохранён", "warn"),
+        ui.c(f"  файл: {_where(path)}", "dim"),
+        None,  # type: ignore[list-item]
+        ui.c(f"  там сейчас: {ui.trim(_disk_line(path), room)}", "dim"),
+        ui.c(f"  станет:     {ui.trim(_streams_line(profile), room)}", "dim"),
+        "",
+        ui.c("  y перезаписать   n другое имя   "
+             "любая другая клавиша - отмена", "dim"),
+    ]
+
+
+def _streams_line(profile: Profile) -> str:
+    """Чем профиль является - по самим потокам, а не по подписи.
+
+    Подпись у пресета стоит фиксированная («L3 IPv4 - маршрутизация») и правку
+    размера со скоростью не описывает - то есть ровно то, что здесь надо
+    сравнить, в ней и не видно.
+    """
+    return ", ".join(_describe(s) for s in profile.streams[:2]) or "нет потоков"
+
+
+def _disk_line(path: Path) -> str:
+    """То же про профиль, который уже лежит в файле."""
+    try:
+        return _streams_line(Profile.load(path))
+    except (OSError, ValueError):
+        return "не читается"
+
+
+def _would_overwrite(path: Path, profile: Profile) -> bool:
+    """Whether saving this profile would change what that file already holds."""
+    return path.exists() and not _same_on_disk(path, profile)
+
+
+def _same_on_disk(path: Path, profile: Profile) -> bool:
+    """Whether that file holds exactly this profile - by content, not by bytes.
+
+    Сравнивать текстом нельзя: ``rate_value`` 7000 после загрузки становится
+    7000.0, и профиль, только что открытый из своего же файла, выглядел бы
+    изменённым. Сторож спрашивал бы на каждом открытии, а вопрос, который
+    задают там, где терять нечего, перестают читать.
+
+    Нечитаемый файл - это «не то же самое»: сказать, что в нём, мы не можем.
+    """
+    try:
+        return Profile.load(path).to_dict() == profile.to_dict()
+    except (OSError, ValueError):
+        return False
+
+
+def _where(path: Path, room: int = 44) -> str:
+    """Путь, из которого видно файл: режется голова, а не имя.
+
+    Каталог профилей бывает длинным (во временном каталоге теста - очень), а
+    узнать из строки надо ровно одно - какой файл.
+    """
+    text = str(path)
+    if ui.width_of(text) <= room:
+        return text
+    return "…/" + "/".join(path.parts[-2:])
+
+
+# --------------------------------------------------------------------------- #
+# Сохранён ли он на самом деле
+# --------------------------------------------------------------------------- #
+def saved_state(session: Session,
+                profile: Profile | None = None) -> tuple[bool, str]:
+    """Whether what is in hand is also on disk, and the line that says which.
+
+    ``Session.remember_profile`` swallows the ``OSError`` and quietly empties
+    the remembered path, so on a profile directory nobody can write to, the
+    stream screen showed the edit, the disk held nothing, and the next sitting
+    opened with "трафик не собран". The screen that showed the edit is the one
+    that has to admit it did not survive.
+    """
+    profile = profile or session.profile
+    if profile is None:
+        return True, ""
+    path = session.profile_path(profile.name)
+    shown = _where(path)
+    if not path.exists():
+        return False, f"не сохранён: файла {shown} нет"
+    if not _same_on_disk(path, profile):
+        return False, f"правки не сохранены: в {shown} другая версия"
+    return True, f"сохранён: {shown}"
+
+
+def unsaved_note(session: Session) -> str:
+    """«не сохранён» для сводки профиля на главном экране, иначе пустая строка.
+
+    Что считать сохранённым, решается в одном месте и живёт здесь; строку
+    рисует launcher, и ему нужно из этого решения только одно слово.
+    """
+    saved, _line = saved_state(session)
+    return "" if saved else "не сохранён"
+
+
+def destination(profile: Profile) -> str:
+    """Куда уйдёт трафик - одной строкой, для сводки и для экрана потоков.
+
+    Сводка профиля называла имя, число потоков и скорость, то есть всё, кроме
+    единственного, что делает прогон правильным или бессмысленным: адреса
+    назначения. Считается здесь, печатается тем, кто сводку рисует.
+    """
+    streams = profile.enabled_streams or profile.streams
+    if not streams:
+        return ""
+    seen = [stream_destination(s) for s in streams]
+    extra = len(set(seen)) - 1
+    return seen[0] + (f"  +{extra}" if extra > 0 else "")
+
+
+def stream_destination(stream: Stream) -> str:
+    """Адрес назначения одного потока, с диапазоном, если он перебирается."""
+    p = stream.packet
+    if not p.has_ip:
+        return p.eth_dst
+    where = _walked(stream, FieldTarget.IP_DST) or p.ip_dst
+    if not p.has_l4:
+        return where
+    port = _walked(stream, FieldTarget.DPORT) or str(p.dport)
+    return f"{where}:{port}"
+
+
+def _walked(stream: Stream, target: FieldTarget) -> str:
+    """Диапазон по этому полю, если поле перебирается, иначе пустая строка."""
+    for vf in stream.vm_fields:
+        if vf.target is target:
+            return f"{vf.min_value}..{vf.max_value}"
+    return ""
+
+
+# --------------------------------------------------------------------------- #
 # The guided build
 # --------------------------------------------------------------------------- #
 def wizard(session: Session) -> Profile | None:
     """Four questions, in dependency order. None if backed out at any step."""
-    del session
     layer = _ask_layer()
     if layer is None:
         return None
+
+    # Движок и скорость линии нужны уже здесь: подсказка под скоростью и
+    # заметка на принятое значение - его политика, а «% от линии» считается от
+    # этой цели. Раньше сеанс здесь выбрасывался, и оба брались из умолчания.
+    engine = engines.get(session.target.engine)
+    link_mbit = session.target.link_mbit
 
     stream = Stream(name="s1", packet=Packet(layer=layer))
     _default_for(stream, layer)
 
     if not _ask_fields(stream, step=2):
         return None
-    if not _ask_ranges(stream, step=3):
+    if not _ask_ranges(stream, engine, step=3):
         return None
-    if not _ask_rate(stream, step=4):
+    if not _ask_rate(stream, engine, link_mbit, step=4):
         return None
 
     name = _profile_name(layer, stream)
@@ -163,16 +342,42 @@ def _ask_fields(stream: Stream, step: int) -> bool:
     """The frame's own fields, filtered to the layer that has them."""
     title = f"{t('w_fields')}   -   {t('step', n=step, total=4)}"
     done = {"ok": False}
+    while True:
+        done["ok"] = False
+        # Функцией, а не списком: поля этого экрана меняют тот же поток, который
+        # шапка описывает, и посчитанная один раз она расходится с ними сразу -
+        # размер поставлен 60, а в шапке до выхода с экрана держится прежний.
+        edit_form(title, packet_fields(stream), width=ui.WIDE,
+                  keys_hint="↑/↓ поле   ↵ править   n дальше   "
+                            "q бросить сборку",
+                  header=lambda: [ui.c("  " + _preview(stream), "dim")],
+                  extra_keys={"n": lambda: _finish_if_valid(stream, done)})
+        if done["ok"]:
+            return True
+        if _abandon(step):
+            return False
 
-    def finish() -> str:
-        done["ok"] = True
-        return ""
 
-    edit_form(title, packet_fields(stream), width=ui.WIDE,
-              keys_hint="↑/↓ поле   ↵ править   n дальше   q отмена",
-              header=[ui.c("  " + _preview(stream), "dim")],
-              extra_keys={"n": lambda: _finish_if_valid(stream, done)})
-    return done["ok"]
+def _abandon(step: int) -> bool:
+    """Confirm dropping the whole wizard, because one key should not do it.
+
+    Step 3 taught the hand that ``q`` means "дальше" - the ranges screen had it
+    in the footer - and the same key on step 4 threw away four screens of work
+    without asking. The keys say the same thing everywhere now; this is the
+    second half of that, for the hand that already learned the old meaning.
+
+    Without a terminal there is nobody to ask and nothing was entered, so the
+    wizard is dropped - which is also what it did before.
+    """
+    if not ui.interactive():
+        return True
+    answer = ui.notice([
+        ui.c("  Бросить сборку?", "warn"),
+        ui.c(f"  Собранное на шагах 1-{step} из 4 потеряется.", "dim"),
+        "",
+        ui.c("  y бросить   любая другая клавиша - вернуться к сборке", "dim"),
+    ], ui.WIDE)
+    return answer in ("y", "д")
 
 
 def _finish_if_valid(stream: Stream, done: dict[str, bool]) -> str:
@@ -189,20 +394,26 @@ def _finish_if_valid(stream: Stream, done: dict[str, bool]) -> str:
     return FORM_EXIT
 
 
-def _ask_ranges(stream: Stream, step: int) -> bool:
+def _ask_ranges(stream: Stream, engine: engines.Engine, step: int) -> bool:
     title = f"{t('w_ranges')}   -   {t('step', n=step, total=4)}"
-    ranges_screen(stream, title=title)
-    return True
+    return ranges_screen(stream, engine, title=title, wizard=True)
 
 
-def _ask_rate(stream: Stream, step: int) -> bool:
+def _ask_rate(stream: Stream, engine: engines.Engine, link_mbit: int,
+              step: int) -> bool:
     title = f"{t('w_rate')}   -   {t('step', n=step, total=4)}"
     done = {"ok": False}
-    edit_form(title, rate_fields(stream), width=ui.WIDE,
-              keys_hint="↑/↓ поле   ↵ править   n готово   q отмена",
-              header=[ui.c("  " + _preview(stream), "dim")],
-              extra_keys={"n": lambda: _finish_if_valid(stream, done)})
-    return done["ok"]
+    while True:
+        done["ok"] = False
+        edit_form(title, rate_fields(stream, engine, link_mbit), width=ui.WIDE,
+                  keys_hint="↑/↓ поле   ↵ править   n готово   "
+                            "q бросить сборку",
+                  header=lambda: [ui.c("  " + _preview(stream), "dim")],
+                  extra_keys={"n": lambda: _finish_if_valid(stream, done)})
+        if done["ok"]:
+            return True
+        if _abandon(step):
+            return False
 
 
 def _profile_name(layer: str, stream: Stream) -> str:
@@ -331,7 +542,17 @@ def _size_note(p: Packet) -> str:
     return ""
 
 
-def rate_fields(stream: Stream) -> list[Field]:
+def rate_fields(stream: Stream, engine: engines.Engine,
+                link_mbit: int) -> list[Field]:
+    """The rate questions, priced against the engine and the line that will
+    carry them.
+
+    Neither argument has a default on purpose: the defect this signature fixes
+    was exactly a default. ``_rate_note`` used to call ``stream.pps()`` with no
+    link, so on a 25G target a stream set to "50% of the line" was announced as
+    ~411 184 pps when it was ten million, and the standing hint said "Scapy"
+    whatever was selected.
+    """
     burst = lambda: stream.tx_mode is not TxMode.CONTINUOUS
     multi = lambda: stream.tx_mode is TxMode.MULTI_BURST
 
@@ -346,7 +567,7 @@ def rate_fields(stream: Stream) -> list[Field]:
         if stream.rate_type is RateType.PERCENT and x > 100:
             return f"! {t('p_rate')}: больше 100% линии не бывает"
         stream.rate_value = x
-        return _rate_note(stream)
+        return engine.rate_note(stream, link_mbit)
 
     def set_mode(v: str) -> str:
         stream.tx_mode = TxMode(v)
@@ -378,7 +599,7 @@ def rate_fields(stream: Stream) -> list[Field]:
               kind="pick",
               options=[(value, t(label), "") for value, label in _RATE_UNITS]),
         Field("rate", t("p_rate"), lambda: f"{stream.rate_value:g}", set_rate,
-              hint="Scapy это цель, а не гарантия"),
+              hint=lambda: engine.rate_hint),
         Field("mode", t("p_mode"), lambda: stream.tx_mode.value, set_mode,
               kind="pick",
               options=[(value, t(label), "") for value, label in _TX_MODES]),
@@ -391,56 +612,57 @@ def rate_fields(stream: Stream) -> list[Field]:
     ]
 
 
-def _rate_note(stream: Stream) -> str:
-    """Say out loud when a rate is beyond what this path can carry.
-
-    Scapy through a kernel socket tops out well below a NIC. Somewhere around
-    a hundred thousand frames a second the loop stops keeping up, and a run
-    that quietly delivers a third of what was asked reads as a device problem
-    when it is a tool problem.
-    """
-    pps = stream.pps()
-    if pps > 200_000:
-        return f"! ~{pps:,.0f} pps - Scapy столько не выдаст, возьми меньше"
-    if pps > 50_000:
-        return f"~{pps:,.0f} pps - на грани того, что Scapy тянет"
-    return ""
-
-
 # --------------------------------------------------------------------------- #
 # Ranges
 # --------------------------------------------------------------------------- #
-def ranges_screen(stream: Stream, title: str = "") -> None:
-    """Add, edit and remove the fields that walk instead of holding still."""
+def ranges_screen(stream: Stream, engine: engines.Engine,
+                  title: str = "", wizard: bool = False) -> bool:
+    """Add, edit and remove the fields that walk instead of holding still.
+
+    ``wizard`` is what makes ``q`` mean one thing across the whole guided path.
+    As a wizard step this screen goes forward on ``n`` like the two around it,
+    and ``q`` asks before dropping the build; opened from the stream editor it
+    is just a screen to come back from. Returns whether the caller should carry
+    on - always true outside the wizard.
+    """
     if not ui.interactive():
-        return
+        # Экран не открылся, значит ничего и не подтверждали: для шага визарда
+        # это «дальше нельзя», для стороннего вызова - просто нечего делать.
+        return not wizard
     cursor = 0
     status = ""
     while True:
         rows = list(stream.vm_fields)
         total = len(rows) + 1                       # the trailing "add" row
         cursor = max(0, min(cursor, total - 1))
-        ui.draw(_render_ranges(stream, cursor, status, title))
+        ui.draw(_render_ranges(stream, cursor, status, title, wizard))
         status = ""
         key = ui.read_key()
 
         if key in ("q", "esc", "quit"):
-            return
+            if not wizard:
+                return True
+            if _abandon(3):
+                return False
+            continue
+        if wizard and key == "n":
+            return True
         if key == "up":
             cursor = (cursor - 1) % total
         elif key == "down":
             cursor = (cursor + 1) % total
         elif key == "enter":
             if cursor == len(rows):
-                status = _add_range(stream)
+                status = _add_range(stream, engine)
             else:
-                status = _edit_range(stream, rows[cursor])
+                status = _edit_range(stream, rows[cursor], engine)
         elif key == "d" and cursor < len(rows):
             stream.vm_fields.remove(rows[cursor])
             status = "диапазон убран"
 
 
-def _render_ranges(stream: Stream, cursor: int, status: str, title: str) -> str:
+def _render_ranges(stream: Stream, cursor: int, status: str, title: str,
+                   wizard: bool = False) -> str:
     lines: list[str] = [ui.c(title or t("w_ranges"), "title"),
                         ui.c("  " + _preview(stream), "dim"), None]  # type: ignore[list-item]
     if not stream.vm_fields:
@@ -457,11 +679,13 @@ def _render_ranges(stream: Stream, cursor: int, status: str, title: str) -> str:
     if status:
         lines.append(ui.c("  " + status.lstrip("! "),
                           "bad" if status.startswith("!") else "ok"))
-    lines.append(ui.c("  ↑/↓ выбор   ↵ править   d убрать   q дальше", "dim"))
+    keys = ("↑/↓ выбор   ↵ править   d убрать   n дальше   q бросить сборку"
+            if wizard else "↑/↓ выбор   ↵ править   d убрать   q назад")
+    lines.append(ui.c("  " + keys, "dim"))
     return ui.panel(lines, ui.WIDE)
 
 
-def _add_range(stream: Stream) -> str:
+def _add_range(stream: Stream, engine: engines.Engine) -> str:
     """Offer only the fields this frame actually has, then edit the new one."""
     available = _range_targets(stream)
     if not available:
@@ -474,7 +698,7 @@ def _add_range(stream: Stream) -> str:
     target = available[picked]
     vf = VMField(target=target, **_range_defaults(target, stream))
     stream.vm_fields.append(vf)
-    return _edit_range(stream, vf)
+    return _edit_range(stream, vf, engine)
 
 
 def _range_targets(stream: Stream) -> list[FieldTarget]:
@@ -515,7 +739,7 @@ def _bump(ip: str) -> str:
     return str(ipaddress.IPv4Address(min(base + 253, 2 ** 32 - 1)))
 
 
-def _edit_range(stream: Stream, vf: VMField) -> str:
+def _edit_range(stream: Stream, vf: VMField, engine: engines.Engine) -> str:
     """The three questions a range has: how it walks, from where, to where."""
     is_ip = vf.target.is_ip
 
@@ -535,7 +759,7 @@ def _edit_range(stream: Stream, vf: VMField) -> str:
                 if err:
                     return err
                 setattr(vf, attr, str(n))
-            return _range_note(vf)
+            return _range_note(vf, engine)
         return setter
 
     def set_step(v: str) -> str:
@@ -543,7 +767,7 @@ def _edit_range(stream: Stream, vf: VMField) -> str:
         if err:
             return err
         vf.step = n
-        return _range_note(vf)
+        return _range_note(vf, engine)
 
     fields = [
         Field("op", "как перебирать", lambda: vf.op.value, set_op, kind="pick",
@@ -557,28 +781,22 @@ def _edit_range(stream: Stream, vf: VMField) -> str:
     ]
     edit_form(f"Диапазон - {vf.target.label}", fields, width=ui.WIDE,
               keys_hint="↑/↓ поле   ↵ править   q готово",
-              header=[ui.c("  " + _preview(stream), "dim")])
-    return _range_note(vf) or "диапазон обновлён"
+              header=lambda: [ui.c("  " + _preview(stream), "dim")])
+    return _range_note(vf, engine) or "диапазон обновлён"
 
 
-def _range_note(vf: VMField) -> str:
-    """Flag a range that will be truncated before the run finds out for us.
+def _range_note(vf: VMField, engine: engines.Engine) -> str:
+    """What is wrong with this range, then what this engine will do to it.
 
-    Which engine is selected decides whether it is truncated at all - Scapy
-    expands a range into frames and caps it, TRex hands it to the field engine
-    and walks all of it - and this form is deep enough inside the builder that
-    it has no target to ask. So it names both rather than warning about a limit
-    that may not apply or staying silent about one that does.
+    The first check is the model's and holds whoever sends: ends that do not
+    parse, or that run backwards, describe no range at all. Whether a range
+    that *is* a range gets walked in full is the engine's business - Scapy
+    expands it into frames and caps the result, TRex and Ixia hand it to
+    hardware that counts through all of it - so that half is asked, not guessed.
     """
-    from traphy.codegen import EXPAND_CAP
-
-    size = range_size(vf)
-    if size == 0:
+    if range_size(vf) == 0:
         return "! концы диапазона не разбираются или стоят задом наперёд"
-    if vf.op is not VMOp.RANDOM and size > EXPAND_CAP:
-        return (f"! {size} значений - на Scapy урежется до {EXPAND_CAP}, "
-                f"TRex обойдёт все; возьми шаг больше или диапазон уже")
-    return ""
+    return engine.range_note(vf)
 
 
 # --------------------------------------------------------------------------- #
@@ -599,7 +817,7 @@ def streams_screen(session: Session) -> None:
         key = ui.read_key()
 
         if key in ("q", "esc", "quit"):
-            session.remember_profile(profile)
+            _save_on_exit(session, profile)
             return
         if key == "up":
             cursor = (cursor - 1) % total
@@ -610,7 +828,9 @@ def streams_screen(session: Session) -> None:
                 profile.streams.append(_new_stream(profile))
                 status = "поток добавлен"
             else:
-                stream_editor(profile.streams[cursor])
+                stream_editor(profile.streams[cursor],
+                              engines.get(session.target.engine),
+                              session.target.link_mbit)
         elif key == " " and cursor < len(profile.streams):
             s = profile.streams[cursor]
             s.enabled = not s.enabled
@@ -619,15 +839,47 @@ def streams_screen(session: Session) -> None:
             status = _delete_stream(profile, cursor)
 
 
+def _save_on_exit(session: Session, profile: Profile) -> None:
+    """Save on the way out, and say it out loud when the disk did not take it.
+
+    The save itself swallows its ``OSError``, so "сохранено" was the only thing
+    this screen could ever report. A run of the tool that ends believing a
+    profile exists is worse than one that ends knowing it does not: the next
+    sitting opens with nothing composed and no idea why.
+    """
+    session.remember_profile(profile)
+    saved, line = saved_state(session, profile)
+    if saved:
+        return
+    ui.notice([
+        ui.c("  Правка НЕ сохранена", "bad"),
+        ui.c("  " + line, "warn"),
+        "",
+        ui.c("  Собранное живёт только в этом сеансе - следующий запуск "
+             "откроется без него.", "dim"),
+        ui.c("  Обычно это права на каталог профилей.", "dim"),
+        "",
+        ui.c("  " + t("keys_any"), "dim"),
+    ], ui.WIDE)
+
+
 def _render_streams(session: Session, profile: Profile, cursor: int,
                     status: str) -> str:
     lines: list[str] = [ui.c(t("streams_head", name=profile.name), "title")]
     # Asked of the engine, not of the Scapy generator: the same /16 sweep is
     # 1024 frames there and 65 536 here, and the number on the screen has to
     # be the one this target will actually build.
-    frames = engines.get(session.target.engine).frame_count(profile)
+    engine = engines.get(session.target.engine)
+    frames = engine.frame_count(profile)
     pps = f"{profile.total_pps(session.target.link_mbit):,.0f}".replace(",", " ")
     lines.append(ui.c("  " + t("total_rate", pps=pps, frames=frames), "dim"))
+    # Куда шлём - на экране, а не только в скрипте: убедиться, что трафик пойдёт
+    # по адресу, иначе можно было только открыв profile.json руками.
+    lines.append(ui.c(f"  куда: {destination(profile)}", "dim"))
+    # И сохранён ли он. Правка, которую диск не взял, выглядела здесь ровно так
+    # же, как взятая, - экран показывал её из памяти.
+    saved, where = saved_state(session, profile)
+    lines.append(ui.c("  " + where, "dim" if saved else "warn"))
     lines.append(None)  # type: ignore[arg-type]
 
     for i, s in enumerate(profile.streams):
@@ -654,6 +906,11 @@ def _render_streams(session: Session, profile: Profile, cursor: int,
                           "bad" if status.startswith("!") else "ok"))
     for problem in profile.validate():
         lines.append(ui.c(f"  • {problem}", "warn"))
+    # Рядом с проблемами профиля, а не вместо них: это не «нельзя запускать», а
+    # «запустится, но вот это не измерится». Читал их один CLI, и пресет L2 на
+    # TRex уходил из меню молча - человек видел rx=0 и шёл проверять коробку.
+    for warning in engine.warnings(profile):
+        lines.append(ui.c(f"  • {warning}", "warn"))
     lines.append(ui.c("  " + t("keys_streams"), "dim"))
     return ui.panel(lines, ui.WIDE)
 
@@ -680,23 +937,26 @@ def _delete_stream(profile: Profile, index: int) -> str:
     if len(profile.streams) <= 1:
         return "! " + t("last_stream")
     doomed = profile.streams[index]
-    answer = ui.notice([ui.c("  " + t("confirm_delete", name=doomed.name), "warn")],
-                       ui.WIDE)
-    if answer in ("y", "д", "enter"):
+    # Через общий `ui.confirm`, а не «любая клавиша»: на каждой другой панели
+    # инструмента Enter значит «закрыть», и только здесь он значил «удалить».
+    # Рука, привыкшая закрывать панели Enter'ом, стирала поток.
+    if ui.confirm([ui.c("  " + t("confirm_delete", name=doomed.name), "warn")],
+                  ui.WIDE):
         profile.streams.pop(index)
         return f"поток «{doomed.name}» удалён"
     return ""
 
 
-def stream_editor(stream: Stream) -> None:
+def stream_editor(stream: Stream, engine: engines.Engine,
+                  link_mbit: int) -> None:
     """One stream, all of it: fields, rate, and the ranges behind one key."""
-    fields = packet_fields(stream) + rate_fields(stream)
+    fields = packet_fields(stream) + rate_fields(stream, engine, link_mbit)
     edit_form(f"Поток - {stream.name}", fields, width=ui.WIDE,
               keys_hint="↑/↓ поле   ↵ править   r диапазоны   q назад",
-              header=[ui.c("  " + _preview(stream), "dim")],
-              extra_keys={"r": lambda: _open_ranges(stream)})
+              header=lambda: [ui.c("  " + _preview(stream), "dim")],
+              extra_keys={"r": lambda: _open_ranges(stream, engine)})
 
 
-def _open_ranges(stream: Stream) -> str:
-    ranges_screen(stream)
+def _open_ranges(stream: Stream, engine: engines.Engine) -> str:
+    ranges_screen(stream, engine)
     return ""

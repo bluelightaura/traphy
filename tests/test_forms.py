@@ -148,12 +148,33 @@ def recalled():
 
 
 def test_an_accepted_value_is_remembered(recalled):
+    # Поле нарочно безобидное: у адресов и логинов памяти нет вовсе, см.
+    # соседний тест - на них это проверять бессмысленно.
     seen: list[str] = []
-    f = Field("host", "Хост", lambda: seen[-1] if seen else "",
+    f = Field("python", "python на хосте", lambda: seen[-1] if seen else "",
               lambda v: (seen.append(v), "")[1])
-    assert forms._accept(f, "10.0.0.1") == ""
-    assert forms.recall().values("host") == ["10.0.0.1"]
+    assert forms._accept(f, "python3.11") == ""
+    assert forms.recall().values("python") == ["python3.11"]
     assert recalled.saves == 1
+
+
+def test_an_address_is_not_remembered_by_any_screen(recalled):
+    """Запрет живёт в формах, а не в каждом экране по отдельности.
+
+    Иначе правило надо помнить при создании любого нового экрана, и первый же
+    забывший унёс бы адреса устройства под тестом в файл состояния - а оттуда
+    на экран, списком «вводилось раньше», то есть в любой скриншот формы.
+    """
+    def watched(key: str) -> Field:
+        seen: list[str] = []
+        return Field(key, key, lambda: seen[-1] if seen else "",
+                     lambda v: (seen.append(v), "")[1])
+
+    for key in ("host", "ip_dst", "eth_dst", "min", "max"):
+        f = watched(key)
+        assert forms._accept(f, "203.0.113.7") == ""
+        assert forms.recall().values(key) == [], key
+        assert forms._remembered(f) == [], key
 
 
 def test_a_refused_value_is_not_remembered(recalled):
@@ -224,3 +245,27 @@ def test_fields_without_a_group_print_no_heading():
     rows = [Field("a", "Поле A", lambda: "1", lambda _v: "")]
     out = forms._render("Т", rows, 0, "", 70, None, "", 20)
     assert "Поле A" in out
+
+
+def test_a_header_given_as_a_function_is_asked_on_every_redraw(monkeypatch):
+    """Шапка описывает то, что правят под ней. Посчитанная один раз, она до
+    выхода с экрана показывает прежние значения - дефект, который уже починили
+    на форме цели, а потом он вернулся в четыре экрана сборки трафика. Теста
+    тогда не завели, поэтому вот он."""
+    from traphy import ui
+
+    asked = {"n": 0}
+
+    def header() -> list[str]:
+        asked["n"] += 1
+        return [f"перерисовка {asked['n']}"]
+
+    keys = iter(["down", "up", "q"])
+    monkeypatch.setattr(ui, "interactive", lambda: True)
+    monkeypatch.setattr(ui, "draw", lambda text: None)
+    monkeypatch.setattr(ui, "read_key", lambda timeout=None: next(keys))
+
+    rows = [Field("a", "Поле A", lambda: "1", lambda _v: ""),
+            Field("b", "Поле B", lambda: "2", lambda _v: "")]
+    forms.edit_form("Т", rows, header=header)
+    assert asked["n"] == 3, "шапка посчитана не на каждой перерисовке"

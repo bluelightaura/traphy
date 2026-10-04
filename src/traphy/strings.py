@@ -88,9 +88,13 @@ S: dict[str, dict[str, str]] = {
                         "p ask the target   q back"},
     "keys_streams": {"ru": "↑/↓ поток   ↵ править   space вкл/выкл   d удалить   q назад",
                      "en": "↑/↓ stream   ↵ edit   space on/off   d delete   q back"},
-    "keys_scroll": {"ru": "↑/↓ строка   ←/→ страница   q назад",
-                    "en": "↑/↓ line   ←/→ page   q back"},
+    "keys_scroll": {"ru": "↑/↓ строка   PgUp/PgDn страница   q назад",
+                    "en": "↑/↓ line   PgUp/PgDn page   q back"},
     "keys_any": {"ru": "любая клавиша - назад", "en": "any key - back"},
+    # Почему строка меню заперта движком. Своё поле `status` у движка есть, но
+    # оно только по-русски, а замок обязан читаться на обоих языках.
+    "engine_locked": {"ru": "движок не умеет слать - выбери другой",
+                      "en": "this engine cannot send - pick another"},
     "keys_run": {"ru": "Ctrl-C - прервать прогон", "en": "Ctrl-C - stop the run"},
 
     # ---- target form -------------------------------------------------- #
@@ -157,8 +161,8 @@ S: dict[str, dict[str, str]] = {
     "v_current": {"ru": "сейчас в поле", "en": "current value"},
     "v_own": {"ru": "ввести своё…", "en": "type a new value…"},
     "v_own_hint": {"ru": "набрать вручную", "en": "type it in"},
-    "keys_value": {"ru": "↑/↓ выбор   ↵ ок   q назад",
-                   "en": "↑/↓ pick   ↵ ok   q back"},
+    "keys_value": {"ru": "↑/↓ выбор   ↵ ок   буква - ввод   q назад",
+                   "en": "↑/↓ pick   ↵ ok   a letter types   q back"},
     "rx_unset": {"ru": "не задан - потери мерить нечем",
                  "en": "unset - loss cannot be measured"},
     "checking": {"ru": "проверяю связь с {host}…", "en": "checking {host}…"},

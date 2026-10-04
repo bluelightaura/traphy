@@ -13,10 +13,11 @@ returns an error string, the panel shows it, and the old value stays.
 
 ``text`` used to mean "drop the whole interface and print a bare prompt onto the
 scrollback" - for a value that is nearly always either one of two or three usual
-ones or the one entered last time. So a text field now offers those first and
-keeps typing as the last line of the list rather than the only way in. What has
-been entered before is remembered per field, five values deep, and never for a
-field marked secret.
+ones or the one entered last time. So a text field offers those, with typing as
+the first row of the list and a letter typed anywhere in it going straight to
+the prompt: the gesture the prompt taught - Enter, type, Enter - has to keep
+working, or the list quietly keeps the old value. What has been entered before
+is remembered per field, five values deep, and never for a field marked secret.
 """
 
 from __future__ import annotations
@@ -205,6 +206,12 @@ def _edit_text(f: Field, width: int) -> str:
 
     Пустой список с одним пунктом «ввести своё» был бы лишним экраном на пути к
     тому же вводу, поэтому когда предлагать нечего - сразу ввод.
+
+    «Ввести своё» идёт первым, и с него же начинается любая набранная в списке
+    буква. Жест «Enter - набрать - Enter» старше этого списка: пока буквы
+    проваливались в никуда, Enter принимал то, что под курсором, то есть
+    прежнее значение - человек уходил с экрана уверенным, что сменил адрес,
+    а прогон уезжал на прежнюю коробку.
     """
     current = f.value().strip()
     standard = [(v, note) for v, note in _suggested(f) if v]
@@ -213,27 +220,29 @@ def _edit_text(f: Field, width: int) -> str:
     if not standard and not past:
         return _type_in(f)
 
-    options: list[tuple[str, str]] = []
-    values: list[str | None] = []
+    options: list[tuple[str, str]] = [(t("v_own"), t("v_own_hint"))]
+    values: list[str | None] = [None]
     for value, note in standard + past:
         options.append((value, t("v_current") if value == current else note))
         values.append(value)
-    options.append((t("v_own"), t("v_own_hint")))
-    values.append(None)
 
     cursor = values.index(current) if current in values else 0
     picked = ui.choose(f.label, options, cursor=cursor,
-                       keys_hint=t("keys_value"), width=width)
+                       keys_hint=t("keys_value"), width=width,
+                       typing=not f.secret)
     if picked is None:
         return ""
+    if isinstance(picked, str):
+        # Набранная буква - это начало значения, а не промах по списку.
+        return _type_in(f, seed=picked)
     chosen = values[picked]
     return _type_in(f) if chosen is None else _accept(f, chosen)
 
 
-def _type_in(f: Field) -> str:
+def _type_in(f: Field, seed: str = "") -> str:
     # У секрета текущее значение в приглашении не показываем даже подписью.
     prompt = f"{f.label}: " if f.secret else f"{f.label} [{f.value()}]: "
-    typed = ui.ask_line(prompt, secret=f.secret)
+    typed = ui.ask_line(prompt, secret=f.secret, prefill=seed)
     if typed == "":
         return ""
     return _accept(f, typed)
@@ -249,11 +258,22 @@ def _accept(f: Field, value: str) -> str:
     error = f.set(value)
     if error:
         return error
-    if f.remember and not f.secret:
+    if _may_remember(f):
         store = recall()
         if store:
             store.add(f.key, f.value() or value)
     return ""
+
+
+def _may_remember(f: Field) -> bool:
+    """Можно ли вообще держать прошлые значения этого поля.
+
+    Правило живёт здесь, а не в каждом экране. Раньше каждая форма сама снимала
+    `remember` с опасных полей - то есть правило надо было помнить при создании
+    любого нового экрана, и первый же забывший унёс бы адреса устройства под
+    тестом в файл состояния и на экран списком «вводилось раньше».
+    """
+    return f.remember and not f.secret and f.key not in prefs_mod.NEVER_REMEMBERED
 
 
 def _suggested(f: Field) -> list[tuple[str, str]]:
@@ -269,7 +289,7 @@ def _suggested(f: Field) -> list[tuple[str, str]]:
 
 
 def _remembered(f: Field) -> list[str]:
-    if f.secret or not f.remember:
+    if not _may_remember(f):
         # У секрета памяти нет ни на запись, ни на чтение: список прошлых
         # паролей на экране - это ровно то, чего быть не должно.
         return []
@@ -349,7 +369,9 @@ def _render(title: str, rows: list[Field], cursor: int, status: str,
         # съедала единственное полезное: «…— p подхватит».
         for line in _fold(status.lstrip("! "), width - 4):
             lines.append(ui.c("  " + line, role))
-    lines.append(ui.c("  " + (keys_hint or t("keys_form")), "dim"))
+    # Подсказкой целиком: в ней последним стоит «q назад», то есть ровно то,
+    # что обрезка и съедала - единственное указание, как уйти с экрана.
+    lines.extend(ui.hint_rows(keys_hint or t("keys_form"), width))
     return ui.panel(lines, width)
 
 

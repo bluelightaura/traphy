@@ -15,6 +15,7 @@ table lookup rather than a search for hardcoded escapes.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unicodedata
 from collections.abc import Iterable
@@ -189,6 +190,43 @@ def dim_row(text: str, width: int = WIDTH) -> str:
     return c(pad(strip_ansi(text), width), "dim")
 
 
+# Промежуток между группами подсказки - два пробела и больше. Внутри группы
+# («↑/↓ строка») пробел один, поэтому группа цела; точка-разделитель стоит в
+# таких же промежутках и становится отдельной группой, то есть собранная строка
+# выглядит ровно как была, пока влезает.
+_GAPS = re.compile(r"\s{2,}")
+
+
+def hint_rows(text: str, width: int = WIDTH, indent: str = "  ",
+              role: str = "dim") -> list[str]:
+    """The key hint as however many rows it needs, instead of a trimmed one.
+
+    A panel trims what does not fit, and the hint is the one row that must not
+    be trimmed: what trimming takes is the tail, and the tail is where "q
+    назад" sits - the only thing on the screen saying how to leave. Russian
+    hints run longer than the English they were written against, and the script
+    footer is already past the 72 columns of a wide panel.
+
+    Rows are broken between key groups, never inside one, so "↑/↓ строка" does
+    not end up with its arrows on one line and its noun on the next.
+    """
+    groups = [g for g in _GAPS.split(strip_ansi(text).strip()) if g]
+    if not groups:
+        return []
+    room = max(1, width - width_of(indent))
+    rows: list[str] = []
+    line = ""
+    for group in groups:
+        probe = f"{line}   {group}" if line else group
+        if line and width_of(probe) > room:
+            rows.append(line)
+            line = group
+        else:
+            line = probe
+    rows.append(line)
+    return [c(indent + r, role) for r in rows]
+
+
 def bar(fraction: float, width: int = 30) -> str:
     """A filled progress bar. Clamped, because callers compute the fraction."""
     fraction = min(1.0, max(0.0, fraction))
@@ -278,8 +316,135 @@ def interactive() -> bool:
     return True
 
 
-def read_key(timeout: float | None = None) -> str:
+# Сколько ждать продолжения escape-последовательности. Стрелка приходит одним
+# куском, но по медленной сессии хвост может отстать; за голым Esc не придёт
+# ничего и никогда - и прежнее «дочитать ровно два байта» на нём вставало
+# насмерть: экран оставался жив, но больше не перерисовывался, а начало
+# следующей стрелки уходило в эти два байта.
+ESC_WAIT = 0.08
+
+# Байты, прочитанные с клавиатуры, но ещё не разобранные. Одно нажатие приходит
+# одним куском, но куском приходят и десять: стрелка - это три байта, и быстрая
+# прокрутка попадает в одно чтение. Выбросить лишнее - снова потерять нажатия,
+# ровно то, из-за чего тут TCSANOW вместо TCSAFLUSH.
+_ahead = bytearray()
+
+# Клавиши, приходящие последовательностью. Разбираются все, которые терминал
+# вообще присылает, а не только стрелки: неразобранная последовательность
+# раньше превращалась в "esc", то есть PageDown закрывал экран.
+_CSI: dict[str, str] = {"A": "up", "B": "down", "C": "right", "D": "left",
+                        "H": "home", "F": "end"}
+_SS3: dict[str, str] = {"P": "f1", "Q": "f2", "R": "f3", "S": "f4",
+                        "A": "up", "B": "down", "C": "right", "D": "left",
+                        "H": "home", "F": "end"}
+_TILDE: dict[int, str] = {1: "home", 2: "insert", 3: "delete", 4: "end",
+                          5: "pgup", 6: "pgdn", 7: "home", 8: "end",
+                          11: "f1", 12: "f2", 13: "f3", 14: "f4", 15: "f5",
+                          17: "f6", 18: "f7", 19: "f8", 20: "f9", 21: "f10",
+                          23: "f11", 24: "f12"}
+
+
+def _take(fd: int, timeout: float | None) -> int | None:
+    """One byte from the keyboard, or None when it did not arrive in time.
+
+    Через ``os.read``, а не ``sys.stdin.read``: текстовый поток дочитывает в
+    свой буфер всё, что успело прийти, и ``select`` после этого отвечает
+    «пусто», хотя хвост стрелки уже лежит в буфере Python. На таком ответе
+    голый Esc и стрелка неразличимы - а различить их тут и надо.
+    """
+    import select
+
+    if not _ahead:
+        if timeout is not None:
+            ready, _w, _x = select.select([fd], [], [], timeout)
+            if not ready:
+                return None
+        try:
+            chunk = os.read(fd, 64)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        _ahead.extend(chunk)
+    return _ahead.pop(0)
+
+
+def _char(fd: int, first: int) -> str:
+    """Собрать символ из байтов: «д» - это два байта UTF-8, и половина байта
+    не равна ни «д», ни чему-либо ещё, что можно сравнить с клавишей."""
+    need = 4 if first >= 0xf0 else 3 if first >= 0xe0 else 2 if first >= 0xc0 else 1
+    buf = bytearray([first])
+    while len(buf) < need:
+        nxt = _take(fd, ESC_WAIT)
+        if nxt is None:
+            break
+        buf.append(nxt)
+    return buf.decode("utf-8", "replace")
+
+
+def _escape(fd: int) -> str:
+    """Name the key whose sequence has just started, or "" for one unknown.
+
+    Nothing here may wait for a byte that is not coming: a bare Esc is the
+    whole key, and the wait for what follows it is a wait with a deadline.
+
+    Неизвестная последовательность - это "", а не "esc": для экрана "esc"
+    значит «закрыться», и PageUp в пейджере закрывал пейджер. То же касается
+    Alt с буквой - она приходит как Esc и буква.
+    """
+    nxt = _take(fd, ESC_WAIT)
+    if nxt is None or nxt == 0x1b:
+        return "esc"                       # голый Esc - это сама клавиша Esc
+    if nxt == 0x5b:                        # '[' - CSI
+        params = ""
+        while True:
+            byte = _take(fd, ESC_WAIT)
+            if byte is None:
+                return ""                  # последовательность обрубило
+            if 0x40 <= byte <= 0x7e:       # финальный байт
+                final = chr(byte)
+                break
+            params += chr(byte)
+        if final == "~":
+            # Параметры модификаторов идут после ';': Ctrl-PageUp - это тот же
+            # PageUp, и ждать от него другого поведения экрану незачем.
+            head = params.split(";")[0]
+            return _TILDE.get(int(head), "") if head.isdigit() else ""
+        return _CSI.get(final, "")
+    if nxt == 0x4f:                        # 'O' - SS3: F1-F4 и стрелки
+        byte = _take(fd, ESC_WAIT)
+        return _SS3.get(chr(byte), "") if byte is not None else ""
+    return ""
+
+
+# Целая последовательность, оставшаяся в прочитанном вперёд. Набранным текстом
+# она не является: «[B» от второй стрелки - это два символа, которых человек не
+# нажимал, и в пароле их к тому же не видно.
+_SEQ = re.compile(r"\x1b(\[[0-9;]*[A-Za-z~]|O.|.)")
+
+
+def _drain() -> str:
+    """Прочитанное вперёд - как текст; буфер при этом пустеет.
+
+    Байты, которые человек успел набрать, уже у нас, и ``input()`` их не
+    увидит. Поэтому перед приглашением их отдают ему в начало строки - иначе
+    быстрый набор терял бы первые символы значения.
+    """
+    if not _ahead:
+        return ""
+    text = _SEQ.sub("", bytes(_ahead).decode("utf-8", "replace"))
+    _ahead.clear()
+    return "".join(ch for ch in text.replace("\r", "\n")
+                   if ch.isprintable() or ch == "\n")
+
+
+def read_key(timeout: float | None = None, *, keep_case: bool = False) -> str:
     """One keypress as a token: up/down/left/right/enter/esc, or a character.
+
+    A key that arrives as an escape sequence comes back named - "up", "pgup",
+    "home", "f5" - and a sequence this does not know comes back as "", not as
+    "esc": screens close on "esc", and a key nobody taught them must not close
+    anything. A bare Esc is still "esc", because the panels promise it.
 
     Raw mode is entered for exactly one read, so a Ctrl-C or a terminal that
     refuses raw mode surfaces immediately instead of wedging the session.
@@ -291,8 +456,12 @@ def read_key(timeout: float | None = None) -> str:
     indicator, a counter - without a keypress to drive the redraw. Without it
     the loop blocks on input, and anything moving on the screen would freeze
     until the operator happened to touch a key.
+
+    ``keep_case`` hands back a typed character as it was typed. Tokens are
+    compared in lower case everywhere, so an ordinary read folds the case; a
+    list that lets a value be typed into it must not, or "DUT" would start the
+    value off as "dut".
     """
-    import select
     import termios
     import tty
 
@@ -304,16 +473,12 @@ def read_key(timeout: float | None = None) -> str:
         # стирало всё, что человек успел нажать, пока рисовался экран -
         # быстрая прокрутка стрелками теряла нажатия и выглядела как залипание.
         tty.setraw(fd, termios.TCSANOW)
-        if timeout is not None:
-            ready, _w, _x = select.select([sys.stdin], [], [], timeout)
-            if not ready:
-                return ""
-        char = sys.stdin.read(1)
-        if char == "\x1b":
-            # An arrow arrives as ESC [ A-D; a bare Esc is the key itself.
-            seq = sys.stdin.read(2)
-            return {"[A": "up", "[B": "down", "[C": "right",
-                    "[D": "left"}.get(seq, "esc")
+        first = _take(fd, timeout)
+        if first is None:
+            return ""
+        if first == 0x1b:
+            return _escape(fd)
+        char = _char(fd, first)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
@@ -325,21 +490,31 @@ def read_key(timeout: float | None = None) -> str:
         return "quit"
     if char == "\t":
         return "tab"
-    return char.lower()
+    return char if keep_case else char.lower()
 
 
-def ask_line(message: str, secret: bool = False) -> str:
+def ask_line(message: str, secret: bool = False, prefill: str = "") -> str:
     """Read one line on the normal terminal, leaving the panel behind.
 
     The alternate screen is dropped for the duration so the person can see what
     they are typing against their own scrollback, then restored.
+
+    ``prefill`` is what was typed before the prompt existed. A letter pressed
+    in a value list is how the operator says "none of these, I am typing one",
+    and it belongs at the head of the line rather than nowhere.
     """
     leave_screen()
     try:
+        prefill += _drain()
+        head, newline, _rest = prefill.partition("\n")
+        if newline:
+            # Enter уже нажат: значение набрали целиком до того, как
+            # приглашение появилось, и спрашивать больше нечего.
+            return head.strip()
         if secret:
             import getpass
-            return getpass.getpass(message)
-        return input(message).strip()
+            return (prefill + getpass.getpass(message)).strip()
+        return (prefill + input(message + prefill)).strip()
     except (EOFError, KeyboardInterrupt):
         return ""
     finally:
@@ -352,29 +527,62 @@ def notice(lines: list[str], width: int = WIDTH, wait: bool = True) -> str:
     return read_key() if wait and interactive() else ""
 
 
+def confirm(lines: list[str], width: int = WIDTH) -> bool:
+    """Ask a yes/no question on a panel. Only an explicit yes is a yes.
+
+    Enter closes a panel everywhere else in the tool - every other one of them
+    says "любая клавиша - назад" - so Enter must not also be the key that
+    deletes something. A confirmation any key answers is not a confirmation,
+    and a terminal that cannot be read answers no.
+    """
+    draw(panel(lines, width))
+    if not interactive():
+        return False
+    return read_key() in ("y", "д")
+
+
 def choose(title: str, options: list[tuple[str, str]], cursor: int = 0,
            keys_hint: str = "↑/↓ выбор   ↵ ок   q назад",
-           width: int = WIDTH) -> int | None:
+           width: int = WIDTH, typing: bool = False) -> int | str | None:
     """A small vertical picker. Returns the chosen index, or None on escape.
 
     Used wherever a screen needs one answer out of a short list and a whole
     screen would be too much - the rate unit, the layer, the TX mode.
+
+    With ``typing`` a printable character comes back as itself instead of being
+    dropped, and the caller opens a prompt with it. A list of values now stands
+    where a bare prompt used to, so the habit is to press Enter and start
+    typing - and a list that eats the letters and then accepts whatever the
+    cursor sat on tells the operator they changed a value when they did not.
+
+    "q" stays "back" even then, because it says so in the hint; a value that
+    starts with it is typed through the "ввести своё" row.
     """
     if not interactive():
         return None
+    stray = False          # нажали клавишу, которой у списка нет
     while True:
         lines: list[str] = [c(title, "title"), ""]
         for i, (label, hint) in enumerate(options):
             text = row("▸" if i == cursor else " ", label, c(hint, "dim"), width)
             lines.append(selected_row(text, width) if i == cursor else pad(text, width))
-        lines.extend(["", c(keys_hint, "dim")])
+        lines.append("")
+        # Молча проигнорированное нажатие выглядит ровно как сломанный экран,
+        # поэтому на такое подсказка отвечает хотя бы цветом.
+        lines.extend(hint_rows(keys_hint, width, role="warn" if stray else "dim"))
         draw(panel(lines, width))
-        key = read_key()
-        if key == "up":
+        key = read_key(keep_case=True) if typing else read_key()
+        stray = False
+        pressed = key.lower()
+        if pressed == "up":
             cursor = (cursor - 1) % len(options)
-        elif key == "down":
+        elif pressed == "down":
             cursor = (cursor + 1) % len(options)
-        elif key == "enter":
+        elif pressed == "enter":
             return cursor
-        elif key in ("q", "esc", "quit", "left"):
+        elif pressed in ("q", "esc", "quit", "left"):
             return None
+        elif typing and len(key) == 1 and key.isprintable():
+            return key
+        elif key:
+            stray = True
