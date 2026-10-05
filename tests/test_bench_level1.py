@@ -25,7 +25,7 @@ from traphy.runner import RunResult, RunSpec, apply_events, execute, run_dir_roo
 from traphy.target import Target
 from traphy.transport import Completed, Transport
 
-from tests.test_trex import FakeClient, events, fake_trex, run_stl  # noqa: F401
+from test_trex import FakeClient, events, fake_trex, run_stl  # noqa: F401
 
 
 class Scripted(Transport):
