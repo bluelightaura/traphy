@@ -278,6 +278,23 @@ def test_without_a_password_the_agent_is_still_used(monkeypatch):
     assert client.kwargs["look_for_keys"] is True
 
 
+def test_a_named_key_turns_the_agent_off(monkeypatch):
+    """«Дан ключ» значит только этот ключ.
+
+    Агент может держать ключ, которым нельзя подписать - RSA, когда этот
+    инструмент отключает ssh-rsa, - и тогда paramiko рушит всё соединение
+    с «key cannot be used for signing» ещё до того, как дойдёт до названного
+    ключа. Поэтому при заданном key_filename агент не трогаем вовсе.
+    """
+    from traphy.transport import SshTransport
+
+    client = _FakeClient()
+    _fake_paramiko(monkeypatch, client)
+    SshTransport(host="10.0.0.9", user="root", key_filename="/home/x/.ssh/id_ed25519")
+    assert client.kwargs["allow_agent"] is False
+    assert client.kwargs["look_for_keys"] is False
+
+
 def test_a_sudo_password_makes_sudo_read_stdin_instead_of_refusing():
     """``sudo -n`` is right only while nobody has a password to offer.
 

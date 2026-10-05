@@ -360,13 +360,18 @@ class SshTransport(Transport):
                 password=password or None,
                 key_filename=key_filename or None,
                 timeout=10,
-                # A password means the password. Offering agent and on-disk
-                # keys first looks helpful and is how password auth quietly
-                # stops working: every key counts against the server's
-                # MaxAuthTries (six by default), so a developer with three
-                # keys loaded gets "логин не принят" without the password
-                # having been tried at all.
-                allow_agent=not password, look_for_keys=not password,
+                # A password means the password; a named key means that key.
+                # Offering agent and on-disk keys on top of either looks
+                # helpful and is how both quietly break:
+                #  - every key counts against the server's MaxAuthTries (six
+                #    by default), so a developer with three keys loaded gets
+                #    "логин не принят" before the password is ever tried;
+                #  - an agent holding a key that cannot sign - an RSA key when
+                #    this tool disables ssh-rsa - aborts the whole connection
+                #    with "key cannot be used for signing" before the named key
+                #    gets its turn. "Use this key" has to mean only this key.
+                allow_agent=not (password or key_filename),
+                look_for_keys=not (password or key_filename),
                 # Legacy ssh-rsa is SHA-1 signed and has been deprecated for
                 # years; paramiko still offers it for compatibility. Turning it
                 # off for both host keys and user keys is what lets this tool
