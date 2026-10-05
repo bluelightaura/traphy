@@ -237,6 +237,12 @@ class FakeClient:
     rx_port_index = 1
     group_rx_foreign = 0
     group_rx_no_port = False
+    # Что демон знает о своём же счёте: помеченные кадры, которые он не отнёс
+    # ни к одной группе. Подделка про это не знала вовсе, а на живом железе
+    # это единственная цифра, которой групповой счёт опровергает сам себя.
+    flow_err_rx = 0
+    flow_err_tx = 0
+    flow_err_port = 1
 
     def get_stats(self):
         if not getattr(self, "flowing", True):
@@ -256,6 +262,14 @@ class FakeClient:
                 "tx_pkts": {"total": FakeClient.tx // len(counted),
                             0: FakeClient.tx // len(counted)},
                 "rx_pkts": rx,
+            }
+        if FakeClient.flow_err_rx or FakeClient.flow_err_tx:
+            # Порт, на котором демон недосчитался. По умолчанию наш; тест,
+            # который кладёт сюда чужой, проверяет, что соседний прогон не
+            # отменяет наш замер.
+            groups["global"] = {
+                "rx_err": {FakeClient.flow_err_port: FakeClient.flow_err_rx},
+                "tx_err": {0: FakeClient.flow_err_tx},
             }
         out = {
             0: {"opackets": FakeClient.tx, "obytes": FakeClient.tx * 64,
@@ -321,6 +335,9 @@ def fake_trex(monkeypatch):
     FakeClient.traffic_before_start = False
     FakeClient.group_rx_foreign = 0
     FakeClient.group_rx_no_port = False
+    FakeClient.flow_err_rx = 0
+    FakeClient.flow_err_tx = 0
+    FakeClient.flow_err_port = 1
     FakeClient.capture_fails = False
     FakeClient.stop_fails = False
     FakeClient.capture_bytes = b"\xd4\xc3\xb2\xa1rest-of-a-pcap"
@@ -341,6 +358,9 @@ def fake_trex(monkeypatch):
     FakeClient.traffic_before_start = False
     FakeClient.group_rx_foreign = 0
     FakeClient.group_rx_no_port = False
+    FakeClient.flow_err_rx = 0
+    FakeClient.flow_err_tx = 0
+    FakeClient.flow_err_port = 1
     FakeClient.capture_fails = False
     FakeClient.stop_fails = False
 
@@ -925,6 +945,128 @@ def test_port_counters_are_found_whichever_way_the_release_keys_them(
     done = next(e for e in events(capsys) if e["ev"] == "done")
     assert done["rx_source"] == "flow_stats_blind"
     assert done["rx"] == 995
+
+
+# --------------------------------------------------------------------------- #
+# Поимённо по группам, и счёт самого счёта
+# --------------------------------------------------------------------------- #
+def test_each_group_reports_its_own_numbers_not_just_the_sum(fake_trex, capsys):
+    """Сумма отвечает «сколько принято» и молчит про «какой именно группой».
+
+    На стенде отравленной оказалась часть групп, и по одной общей цифре нельзя
+    было сказать, какая именно, - разбирали диффом сгенерированных скриптов.
+    IMIX - три потока, то есть три группы: ровно тот случай, где сумма скрывает
+    расклад."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 3000, 2997, 2997
+    run_stl(codegen_stl.generate(presets.build("imix")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    seen = events(capsys)
+    done = next(e for e in seen if e["ev"] == "done")
+    rows = done["groups"]
+    assert len(rows) == 3, rows
+    # Каждая строка - про свою группу, и сумма строк сходится с общей цифрой.
+    assert sum(row["rx_port"] for row in rows.values()) == done["rx"]
+    assert all(row["port_seen"] for row in rows.values())
+    # И то же самое в каждом тике, а не только в итоге: по архиву должно быть
+    # видно, КОГДА группа разъехалась со счётчиком порта.
+    tick = next(e for e in seen if e["ev"] == "tick")
+    assert len(tick["groups"]) == 3
+
+
+def test_a_group_counting_frames_off_the_receive_port_says_so_by_name(
+        fake_trex, capsys):
+    """Кадры с нашей меткой, пришедшие мимо порта приёма, видны не только в
+    общей цифре ``rx_foreign``, но и в строке той группы, которая их набрала."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 1000, 1000, 1000
+    FakeClient.group_rx_foreign = 40
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    row = next(iter(done["groups"].values()))
+    assert row["rx_foreign"] == 40
+    assert row["rx_port"] == 1000
+    assert done["rx_source"] == "flow_stats_foreign"
+
+
+def test_frames_the_daemon_never_filed_under_a_group_disqualify_the_count(
+        fake_trex, capsys):
+    """``flow_stats['global']['rx_err']`` - демон сознаётся, что часть
+    помеченных кадров приехала и в группу не попала.
+
+    Группа при этом выглядит ровно, недостача ложится в колонку потерь, и
+    отличить её от кадров, съеденных устройством, больше нечем: группа молчит
+    точно так же. Пока эта цифра не читалась, прогон уходил с пометкой
+    «надёжно» - то есть с уверенным неверным ответом."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 4800, 4800
+    FakeClient.flow_err_rx = 200
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    seen = events(capsys)
+    done = next(e for e in seen if e["ev"] == "done")
+    assert done["flow_err_rx"] == 200
+    # Счёт сошёлся сам с собой - и всё равно не надёжен: недостача учёта
+    # выглядит точно как потери.
+    assert done["rx_source"] == "flow_stats"
+    assert done["reliable"] is False
+    said = " ".join(e.get("msg", "") for e in seen if e["ev"] == "note")
+    assert "не отнёс" in said and "200" in said
+
+
+def test_a_clean_global_counter_leaves_the_hardware_count_alone(fake_trex,
+                                                                capsys):
+    """Ноль ошибок учёта - не повод для оговорки: иначе предупреждения
+    перестают читать, и первое настоящее проходит мимо."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 4800, 4800
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["flow_err_rx"] == 0
+    assert done["reliable"] is True
+
+
+def test_an_accounting_shortfall_on_somebody_elses_port_is_not_ours(fake_trex,
+                                                                    capsys):
+    """Генератор общий. Недостача учёта на чужом порту - чужая новость, и
+    сложить её со своей значит отказать своему замеру за соседний прогон."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 5000, 5000
+    FakeClient.flow_err_rx = 900
+    FakeClient.flow_err_port = 7          # не наш порт приёма
+    run_stl(codegen_stl.generate(presets.build("l3_ip")),
+            ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+             "--duration", "1"])
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["flow_err_rx"] == 0
+    assert done["reliable"] is True
+
+
+def test_the_global_counter_is_read_as_a_difference_not_an_absolute(fake_trex,
+                                                                    capsys):
+    """Демон живёт неделями, и его счётчик ошибок учёта - такой же абсолют, как
+    всё остальное. Прочитать его как есть значит однажды дисквалифицировать
+    чистый прогон за чужую недостачу, случившуюся вчера."""
+    FakeClient.tx, FakeClient.rx, FakeClient.group_rx = 5000, 5000, 5000
+    FakeClient.flow_err_rx = 70
+    # Подделка отдаёт ошибки учёта и в окне молчания - то есть они были ДО нас.
+    base = FakeClient._idle_stats
+    def with_global(self):
+        out = base(self)
+        out["flow_stats"]["global"] = {"rx_err": {1: FakeClient.flow_err_rx},
+                                       "tx_err": {0: 0}}
+        return out
+    FakeClient._idle_stats = with_global
+    try:
+        run_stl(codegen_stl.generate(presets.build("l3_ip")),
+                ["--trex-dir", "/nowhere", "--tx-port", "0", "--rx-port", "1",
+                 "--duration", "1"])
+    finally:
+        FakeClient._idle_stats = base
+    done = next(e for e in events(capsys) if e["ev"] == "done")
+    assert done["flow_err_rx"] == 0
+    assert done["reliable"] is True
 
 
 # --------------------------------------------------------------------------- #

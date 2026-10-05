@@ -218,14 +218,26 @@ What changes once a target is switched to TRex:
   engine configuration, not 65 536 frames in memory. Scapy cuts a range like
   that to 1024 and says it did; here there is nothing to cut, and the screen
   shows the real number.
-* **Loss is counted by the hardware.** Every stream has its own flow stats
-  group, and the NIC counts its frames on the receive port. This is not a
-  sniffer catching a mark inside the frame, and so the number goes into a
-  report without qualification.
-* **Ports instead of interfaces.** The NICs have been handed to DPDK and are
-  gone from `/sys/class/net`; a port is addressed by index. The TRex target
-  form asks for numbers, not names, and there is no interface list there -
-  there is nowhere to get one from.
+* **Loss is counted by the hardware - and the hardware is checked too.** Every
+  stream has its own flow stats group and the NIC counts its frames on the
+  receive port. That is not a sniffer catching a mark inside the frame, but "in
+  hardware" does not mean "correct": on a live bench the receive groups sat at
+  zero over a working link, collected somebody else's frames carrying the same
+  tag, and counted arrivals on a port other than ours. So the group figure is
+  checked against the port counter, against an idle reading taken before the
+  start, and against the daemon's own admission (`flow_stats['global']` - the
+  tagged frames it filed under no group at all); a run with nothing to measure
+  refuses to call itself a measurement instead of printing a tidy wrong number.
+* **The receive side is reported group by group.** Every tick in
+  `events.jsonl` carries the breakdown per group and per port, not only the
+  sum: one poisoned group out of three looks exactly like none of them in a
+  total.
+* **Ports instead of interfaces - but not blind.** The NICs have been handed to
+  DPDK and are gone from `/sys/class/net`; a port is addressed by index. The
+  probe asks the daemon itself about each port - link, speed, driver, holder,
+  service mode, acquiring nothing - and the form offers them with those
+  labels. A port held by a colleague, a link that is down, and an index the
+  daemon does not have are all said up front rather than mid-run.
 * **Root is not needed.** The daemon was brought up with it long before us; the
   script that drives it is an ordinary client.
 * **Frames are built by the Scapy from the release itself.** The field engine

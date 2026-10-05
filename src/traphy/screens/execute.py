@@ -290,6 +290,12 @@ class _Live:
                                       # как «принято» значит выбрать за
                                       # человека, какой верить.
                                       "rx_port": 0, "rx_groups": 0,
+                                      # Недостача самого учёта: демон принял
+                                      # помеченный кадр и не отнёс его ни к
+                                      # какой группе. В колонке потерь это
+                                      # выглядит как кадр, съеденный
+                                      # устройством.
+                                      "rx_err": 0,
                                       "link_down": False, "dirty": "",
                                       "errors": {}}
         self.result: RunResult | None = None
@@ -320,6 +326,7 @@ class _Live:
                               t=event.get("t", 0.0), pps=event.get("pps", 0.0),
                               rx_port=event.get("rx_port", 0),
                               rx_groups=event.get("rx_groups", 0),
+                              rx_err=event.get("rx_err", 0),
                               link_down=bool(event.get("link_down")))
         elif kind == "xstats":
             # Ошибки портов растут молча: без них «потерь нет» и «потери все»
@@ -418,6 +425,12 @@ def _honesty_rows(session: Session, s: dict[str, Any]) -> list[str]:
         # Две цифры рядом - это и есть сообщение: когда они расходятся, какой
         # из них верить, решает человек, а не экран.
         rows.append(_counter(t("l_rx_groups"), f"{groups:,}".replace(",", " ")))
+    missed = int(s.get("rx_err", 0) or 0)
+    if missed:
+        # Третья цифра того же ряда, и её нельзя складывать с первыми двумя:
+        # это кадры, про которые демон сознался, что не посчитал их никак.
+        rows.append(ui.c(_counter(t("l_rx_err"),
+                                  f"{missed:,}".replace(",", " ")), "warn"))
     if s.get("link_down"):
         rows.append(ui.c("  " + t("l_link_down"), "warn"))
     if s.get("dirty"):

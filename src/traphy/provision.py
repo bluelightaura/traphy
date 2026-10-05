@@ -52,6 +52,22 @@ MODES = {
 HUGEPAGES_PER_PORT_MB = 1024
 
 
+def normalize_pci(value: str) -> str:
+    """Запись PCI к одному виду - с доменом.
+
+    В trex_cfg.yaml карту обычно пишут как 01:00.0, а sysfs зовёт её
+    0000:01:00.0. Это одна и та же карта, и сравнивать их как строки нельзя:
+    выходило, что в конфигурации портов нет вовсе.
+    """
+    text = str(value).strip().strip("'\"")
+    if not text:
+        return ""
+    parts = text.split(":")
+    if len(parts) == 2:                      # 01:00.0 - домен опущен
+        return f"0000:{text}"
+    return text
+
+
 @dataclass
 class Nic:
     """Сетевая карта глазами генератора, а не глазами коммутатора."""
@@ -142,8 +158,9 @@ class Generator:
     can_sudo: bool = False
 
     def nic(self, pci: str) -> Nic | None:
+        wanted = normalize_pci(pci)
         for card in self.nics:
-            if card.pci == pci:
+            if normalize_pci(card.pci) == wanted:
                 return card
         return None
 
@@ -198,7 +215,9 @@ import sys
 
 NET_CLASS = "0x02"           # класс PCI «сетевой контроллер»
 DPDK_DRIVERS = ("vfio-pci", "igb_uio", "uio_pci_generic")
-PCI_RE = r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}[.][0-9a-fA-F]"
+# Домен в записи PCI необязателен: в trex_cfg.yaml обычно пишут 01:00.0,
+# а sysfs зовёт ту же карту 0000:01:00.0.
+PCI_RE = r"(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}[.][0-9a-fA-F]"
 
 
 def read(path, default=""):
@@ -271,7 +290,7 @@ def pci_cards():
         link = os.path.join(path, "driver")
         if os.path.islink(link):
             driver = os.path.basename(os.readlink(link))
-        names = listdir(os.path.join(path, "net"))
+        names = net_names(path)
         numa = read(os.path.join(path, "numa_node"), "-1")
         cards.append({
             "pci": slot,
@@ -280,6 +299,23 @@ def pci_cards():
             "numa": int(numa) if numa.lstrip("-").isdigit() else -1,
         })
     return cards
+
+
+def net_names(path):
+    """Имя интерфейса этой карты. Пусто - карта не у ядра.
+
+    У virtio сетевое устройство лежит не прямо в каталоге PCI, а на уровень
+    глубже, под virtioN. Искать только в <pci>/net значит не найти имя у
+    обычной виртуалки - и не узнать, что через эту карту идёт наш же сеанс.
+    """
+    direct = listdir(os.path.join(path, "net"))
+    if direct:
+        return direct
+    for entry in listdir(path):
+        deeper = listdir(os.path.join(path, entry, "net"))
+        if deeper:
+            return deeper
+    return []
 
 
 def model_names():
@@ -471,7 +507,7 @@ def read_generator(payload: dict) -> Generator:
         daemon_pid=int(payload.get("daemon_pid", 0)),
         cfg_path=str(payload.get("cfg_path", "")),
         cfg_exists=bool(payload.get("cfg_exists")),
-        cfg_ports=list(payload.get("cfg_ports") or []),
+        cfg_ports=[normalize_pci(p) for p in (payload.get("cfg_ports") or [])],
         is_root=bool(payload.get("is_root")),
         can_sudo=bool(payload.get("can_sudo")),
     )

@@ -120,6 +120,38 @@ def test_the_client_has_every_method_the_script_calls(api, script):
     assert not missing, f"STLClient не знает: {', '.join(missing)}"
 
 
+def test_the_client_has_every_method_the_probe_calls(api):
+    """Опрос цели - такой же клиент демона, и его имена подделка доказать не
+    может по той же причине: она знает ровно те имена, которые в неё вписали.
+
+    Расхождение тут не роняет прогон, а делает хуже - порты показываются без
+    подробностей, то есть «линк не сказан» на живом линке, и человек вбивает
+    номер на память, как до всей этой диагностики.
+    """
+    from traphy import probe
+
+    client = api.STLClient
+    missing = sorted(m for m in _wanted(probe.PROBE_SCRIPT, "client")
+                     if not hasattr(client, m))
+    assert not missing, f"STLClient не знает: {', '.join(missing)}"
+
+
+def test_the_client_accepts_the_keywords_the_probe_passes(api):
+    """``get_port_attr(port=)`` - то, чем опрос спрашивает про каждый порт."""
+    from traphy import probe
+
+    client = api.STLClient
+    wrong: list[str] = []
+    for method, names in sorted(_wanted(probe.PROBE_SCRIPT, "client").items()):
+        attr = getattr(client, method, None)
+        if attr is None:
+            continue
+        refused = _accepts(attr, names)
+        if refused:
+            wrong.append(f"{method}: {', '.join(refused)}")
+    assert not wrong, "релиз не примет: " + "; ".join(wrong)
+
+
 def test_the_client_accepts_the_keywords_the_script_passes(api, script):
     """Владение портами целиком висит на этих подписях: `acquire(ports=,
     force=)`, `release(ports=)`, `remove_all_streams(ports=)`."""

@@ -56,6 +56,10 @@ S: dict[str, dict[str, str]] = {
     "setup_hint": {"ru": "хост, интерфейсы, связь", "en": "host, NICs, reach"},
     "l_rx_port": {"ru": "принято портом", "en": "received on port"},
     "l_rx_groups": {"ru": "принято группами", "en": "received in groups"},
+    # Кадры, которые демон принял с нашей меткой и не отнёс ни к одной группе.
+    # Ровно столько аппаратный счёт недодал - и ровно столько выглядит
+    # потерями устройства, пока эту цифру никто не показывает.
+    "l_rx_err": {"ru": "мимо групп", "en": "filed under no group"},
     "l_link_down": {"ru": "линк на порту приёма лежит - принимать нечем",
                     "en": "the rx port link is down - nothing can arrive"},
     "run_dirty": {"ru": "сегмент залит до старта: порт {port}, группы {groups}",

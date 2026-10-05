@@ -350,6 +350,93 @@ def per_port(value, port):
     return 0, False
 
 
+def sum_ports(value):
+    """Одна цифра из счётчика, который демон отдаёт разбивкой по портам.
+
+    ``total`` берётся как есть, когда он есть: складывать порты самим значит
+    однажды сложить порт с агрегатом и получить двойной счёт.
+    """
+    if isinstance(value, dict):
+        if "total" in value:
+            return int(value.get("total") or 0)
+        return sum(int(v or 0) for v in value.values())
+    return int(value or 0)
+
+
+def flow_global(stats, rx_port=-1, tx_port=-1):
+    """Что демон знает о своём же групповом счёте - ``flow_stats['global']``.
+
+    Там лежат кадры, которые демон не отнёс ни к одной группе: помеченные
+    пришли, а в группу не попали (``rx_err``), и то же на отправке
+    (``tx_err``). Рост этого счётчика означает, что цифра по группам
+    **неполная** - и неполнота ложится ровно в колонку потерь, то есть
+    выглядит как кадры, съеденные устройством.
+
+    Это единственная цифра, которой опровергается сам аппаратный счёт, и
+    именно её у traphy не было, когда группы впервые разошлись со счётчиком
+    порта. Отсутствие ключа - отдельный ответ (``seen``), а не ноль ошибок:
+    релиз, который его не отдаёт, ничего не обещал.
+
+    Считается **по нашему порту**, а не суммой по шасси, и это не
+    придирка: генератор общий, и недостача учёта на чужом порту - чужая
+    новость. Сложить её с нашей значит отказать своему замеру за соседний
+    прогон. Разбивки по порту нет - тогда сумма, потому что молчать о
+    недостаче дороже, чем назвать её приблизительной.
+    """
+    entry = (stats.get("flow_stats") or {}).get("global")
+    if not isinstance(entry, dict):
+        return {"rx_err": 0, "tx_err": 0, "seen": False}
+    return {"rx_err": port_or_sum(entry.get("rx_err"), rx_port),
+            "tx_err": port_or_sum(entry.get("tx_err"), tx_port),
+            "seen": True}
+
+
+def port_or_sum(value, port):
+    """Цифра по этому порту; сумма - только когда разбивки нет вовсе.
+
+    Три разных случая, и путать их нельзя. Демон перечислил порты и наш среди
+    них - берём наш. Демон перечислил порты, нашего там нет - значит по нашему
+    недостачи нет, и подставлять сюда сумму значит отказывать своему замеру за
+    чужой прогон на соседнем порту. Разбивки нет вовсе (одно число или только
+    ``total``) - тогда сумма, потому что молчать о недостаче дороже, чем
+    назвать её приблизительной.
+    """
+    if not isinstance(value, dict):
+        return int(value or 0)
+    here, seen = per_port(value, port)
+    if seen:
+        return here
+    if set(value) <= {"total"}:
+        return sum_ports(value)
+    return 0
+
+
+def group_detail(raw, base):
+    """Разница по КАЖДОЙ группе отдельно, а не сумма по всем.
+
+    Сумма отвечает на «сколько принято» и молчит про «какой именно группой».
+    На стенде это стоило разбора диффом сгенерированных скриптов: в группу
+    текущего прогона попадали кадры прошлого, и по одной общей цифре нельзя
+    было сказать, отравлены все группы или одна. Теперь в архиве прогона
+    видно поимённо - по группе и по тому, пришло ли оно на свой порт приёма.
+    """
+    was = base.get("per_group") or {}
+    out = {}
+    for pg, now in (raw.get("per_group") or {}).items():
+        before = was.get(pg) or {}
+        rx_all = max(0, now["rx"] - int(before.get("rx", 0)))
+        rx_here = max(0, now["rx_port"] - int(before.get("rx_port", 0)))
+        out[pg] = {
+            "tx": max(0, now["tx"] - int(before.get("tx", 0))),
+            "rx": rx_all,
+            "rx_port": rx_here,
+            # Кадры с меткой этой группы, пришедшие мимо нашего порта приёма.
+            "rx_foreign": max(0, rx_all - rx_here) if now["port_seen"] else 0,
+            "port_seen": now["port_seen"],
+        }
+    return out
+
+
 def write_pcap(path, frames):
     """Write one sample frame per stream - what we built, before the engine.
 
@@ -987,6 +1074,16 @@ def absolutes(client, args, pg_ids):
     rx_entry = port_stats(stats, args.rx_port)
     groups = stats.get("flow_stats") or {}
     seen = [groups[pg] for pg in pg_ids if pg in groups]
+    whole = flow_global(stats, args.rx_port, args.tx_port)
+    rows = {}
+    for pg in pg_ids:
+        if pg not in groups:
+            continue
+        here, port_seen = per_port(groups[pg].get("rx_pkts"), args.rx_port)
+        rows[str(pg)] = {"tx": total(groups[pg].get("tx_pkts")),
+                         "rx": total(groups[pg].get("rx_pkts")),
+                         "rx_port": here,
+                         "port_seen": port_seen}
     return {
         "tx": int(port.get("opackets", 0) or 0),
         "tx_bytes": int(port.get("obytes", 0) or 0),
@@ -1002,13 +1099,20 @@ def absolutes(client, args, pg_ids):
         "group_rx_port_seen": any(per_port(g.get("rx_pkts"), args.rx_port)[1]
                                   for g in seen),
         "groups": len(seen),
+        # Та же разбивка, но поимённо: номер группы -> её собственные цифры.
+        "per_group": rows,
+        # Счёт самого счёта: сколько помеченных кадров демон к группам не отнёс.
+        "flow_err_rx": whole["rx_err"],
+        "flow_err_tx": whole["tx_err"],
+        "flow_err_seen": whole["seen"],
     }
 
 
 def ZERO_BASE():
     """Опорная точка, когда её не брали: вычитать нечего."""
     return {"tx": 0, "tx_bytes": 0, "rx_port": 0, "group_tx": 0,
-            "group_rx": 0, "group_rx_port": 0}
+            "group_rx": 0, "group_rx_port": 0, "per_group": {},
+            "flow_err_rx": 0, "flow_err_tx": 0}
 
 
 def sample(client, args, pg_ids, counted_all, base=None):
@@ -1040,6 +1144,14 @@ def sample(client, args, pg_ids, counted_all, base=None):
     rx_entry = raw["rx_port_seen"]
     port_rx = max(0, raw["rx_port"] - base["rx_port"])
     out["rx_port"] = port_rx
+    # Поимённая разбивка и счёт самого счёта едут рядом с суммой - по ним
+    # разбирают прогон потом, когда от него остались только цифры.
+    out["per_group"] = group_detail(raw, base)
+    out["flow_err_rx"] = max(0, raw.get("flow_err_rx", 0)
+                             - base.get("flow_err_rx", 0))
+    out["flow_err_tx"] = max(0, raw.get("flow_err_tx", 0)
+                             - base.get("flow_err_tx", 0))
+    out["flow_err_seen"] = bool(raw.get("flow_err_seen"))
 
     if raw["groups"]:
         group_all = max(0, raw["group_rx"] - base["group_rx"])
@@ -1111,7 +1223,12 @@ def idle_check(client, args, pg_ids, base, quiet):
     if not now["group_rx_port_seen"]:
         group_rx = max(0, now["group_rx"] - base["group_rx"])
     emit(quiet, ev="idle", seconds=args.idle_check, rx_port=port_rx,
-         rx_groups=group_rx, pg_ids=list(pg_ids))
+         rx_groups=group_rx, pg_ids=list(pg_ids),
+         # Какая именно группа успела набрать чужого, пока мы молчали. Одна
+         # отравленная группа из трёх и три отравленные - разные новости, и по
+         # общей сумме они выглядят одинаково.
+         groups=group_detail(now, base),
+         rx_err=max(0, now.get("flow_err_rx", 0) - base.get("flow_err_rx", 0)))
     if group_rx:
         emit(quiet, ev="note",
              msg="до старта в наши группы приёма легло %d кадров за %.1f c - "
@@ -1424,6 +1541,10 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
                 emit(quiet, ev="tick", t=round(now - started, 2),
                      tx=snap["tx"], rx=snap["rx"],
                      rx_port=snap["rx_port"], rx_groups=snap["rx_groups"],
+                     # Разбивка по группам в каждом тике: по архиву должно быть
+                     # видно, когда именно группа разъехалась со счётчиком
+                     # порта, а не только что к концу они не сошлись.
+                     groups=snap["per_group"], rx_err=snap["flow_err_rx"],
                      link_down=link_down, pps=round(snap["tx_pps"], 1))
             if not client.is_traffic_active(ports=[args.tx_port]):
                 break
@@ -1441,6 +1562,21 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         final = sample(client, args, pg_ids, counted_all, base)
         errors, error_kinds = grown_errors(errors_before,
                                            read_xstats(client, ports))
+        if final["flow_err_rx"]:
+            # Демон сам сознался, что часть помеченных кадров к группам не
+            # отнёс. В колонке потерь они выглядят съеденными устройством, и
+            # отличить это от настоящих потерь больше нечем: группа молчит
+            # ровно так же.
+            emit(quiet, ev="note",
+                 msg="групповой счёт неполон: %d принятых кадров демон не "
+                     "отнёс ни к одной группе (flow_stats global rx_err) - "
+                     "столько же выглядит потерянным устройством, хотя "
+                     "описывает учёт, а не кабель" % final["flow_err_rx"])
+        if final["flow_err_tx"]:
+            emit(quiet, ev="note",
+                 msg="групповой счёт неполон на отправке: %d кадров не "
+                     "отнесено к группам (flow_stats global tx_err)"
+                     % final["flow_err_tx"])
         for name in sorted(errors):
             kind = error_kinds[name]
             if kind == "generator":
@@ -1560,6 +1696,11 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         "idle_rx_groups": (idle or {}).get("rx_groups", 0),
         # Сколько кадров нашей группы пришло мимо нашего порта приёма.
         "rx_foreign": final.get("rx_foreign", 0),
+        # Поимённо по группам и счёт самого счёта. Сумма отвечает «сколько»,
+        # и только эти два поля отвечают «какой группой» и «всё ли посчитано».
+        "groups": final.get("per_group") or {},
+        "flow_err_rx": final.get("flow_err_rx", 0),
+        "flow_err_tx": final.get("flow_err_tx", 0),
         # Чем гейт достоверности на принимающей стороне судит о годности замера.
         "ordered": ORDERED,
         "link_down": bool(link_down),
@@ -1571,7 +1712,12 @@ def run(api, args, streams, pg_ids, uncounted, quiet):
         # вернуться не могло, значит в счёт попало чужое. Найдено на стенде
         # 2026-09-30: группа насчитала 46 млн при 20 тысячах отправленных, и
         # прогон уходил с пометкой «надёжно».
-        "reliable": source == "flow_stats" and final["rx"] <= final["tx"],
+        # И ещё одно опровержение, которое раньше было нечем увидеть: демон
+        # не отнёс часть помеченных кадров ни к какой группе. Группа при этом
+        # выглядит ровно, а недостача ложится в потери - то есть аппаратный
+        # счёт неполон, и "надёжно" на нём стоять не может.
+        "reliable": (source == "flow_stats" and final["rx"] <= final["tx"]
+                     and not final.get("flow_err_rx")),
         "truncated": [],
         "note": note,
     }

@@ -55,6 +55,62 @@ class Iface:
 
 
 @dataclass
+class TrexPort:
+    """Один порт генератора, как его описывает сам демон.
+
+    Отдельно от :class:`Iface` потому, что это не интерфейс хоста: карту забрал
+    DPDK, из ``/sys/class/net`` она исчезла, и рассказать про неё может только
+    демон. Номер порта - индекс в его собственном списке, тот самый, который
+    оператор вбивает в цель.
+
+    Пустое поле значит «демон не сказал», а не «нет». Разница дорогая: врать
+    тут можно в обе стороны - выдуманный «линк up» посылает искать поломку в
+    коробке, выдуманный «занят» - искать владельца, которого нет.
+    """
+
+    index: int = 0
+    link: str = ""             # up | down | "" когда не сказал
+    speed_mbit: int = 0        # 0 = не сказал
+    driver: str = ""
+    owner: str = ""            # пусто = свободен, насколько демон знает
+    state: str = ""            # IDLE | TX | DOWN - словами самого демона
+    service: bool | None = None   # None = не сказал
+
+    @property
+    def free(self) -> bool:
+        return not self.owner
+
+    @property
+    def link_known(self) -> bool:
+        return self.link in ("up", "down")
+
+    @property
+    def is_up(self) -> bool:
+        return self.link == "up"
+
+    def describe(self) -> str:
+        bits = [f"порт {self.index}"]
+        if self.driver:
+            bits.append(self.driver)
+        if self.speed_mbit:
+            bits.append(f"{self.speed_mbit // 1000}G" if
+                        self.speed_mbit >= 1000 and self.speed_mbit % 1000 == 0
+                        else f"{self.speed_mbit}M")
+        bits.append(f"линк {self.link}" if self.link_known
+                    else "линк не сказан")
+        if self.owner:
+            bits.append(f"занят: {self.owner}")
+        if self.service:
+            bits.append("сервисный режим")
+        # Состояние словами демона - только когда оно добавляет новое. «линк
+        # down · down» ничего не уточняет, а выглядит как две разные беды.
+        state = self.state.lower()
+        if state and state not in ("idle", "", self.link):
+            bits.append(state)
+        return " · ".join(bits)
+
+
+@dataclass
 class HostInfo:
     """What we learned about the target in one round trip."""
 
@@ -97,6 +153,11 @@ class HostInfo:
     # значит "не сказал" - и ноль лучше догадки: это число пересчитывает
     # проценты линии в pps, и ошибка в нём тихо перекашивает весь замер.
     trex_link_mbit: int = 0
+    # Порты генератора поимённо, как их описал демон: линк, скорость, драйвер,
+    # владелец. До этого про порты было известно ровно одно - сколько их; номер
+    # оператор вбивал на память, а «занят» и «линк упал» выяснялись отказом
+    # посреди прогона.
+    trex_port_info: list[TrexPort] = field(default_factory=list)
 
     # Ixia needs nothing on the target beyond the client library, because the
     # traffic is not produced there - it comes out of a chassis elsewhere.
@@ -291,7 +352,9 @@ def trex_rpc(trex_dir):
     try:
         client = api.STLClient(server="127.0.0.1", sync_port=4501)
         client.connect()
-        return {"trex_rpc": True, "trex_rpc_ports": int(client.get_port_count())}
+        count = int(client.get_port_count())
+        return {"trex_rpc": True, "trex_rpc_ports": count,
+                "trex_port_rows": port_rows(client, count)}
     except Exception as exc:
         return {"trex_rpc": False, "trex_rpc_error": str(exc)[:200] or type(exc).__name__}
     finally:
@@ -300,6 +363,89 @@ def trex_rpc(trex_dir):
                 client.disconnect()
         except Exception:
             pass
+
+def port_attr(client, index):
+    """Атрибуты одного порта, как их отдаёт этот релиз. {} - не отдал.
+
+    Имя параметра у разных релизов разное, поэтому зовётся и так, и так, а
+    отказ обоих - это пустой ответ, а не поломка опроса: порт, про который
+    демон не рассказал, лучше показать без подробностей, чем не показать
+    вовсе.
+    """
+    for kw in (True, False):
+        try:
+            value = client.get_port_attr(port=index) if kw \
+                else client.get_port_attr(index)
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+def owner_of(client, index, attr):
+    """Кто держит порт. Пусто - свободен, насколько об этом можно судить.
+
+    Владелец - единственное в этом опросе, что говорит про людей, а не про
+    железо: генератор общий, и отобранный у коллеги порт посреди его замера -
+    то, что traphy умеет и никогда не делает молча.
+    """
+    for key in ("owner", "owner_name", "user"):
+        value = attr.get(key)
+        if value:
+            return str(value)
+    getter = getattr(client, "get_owner", None)
+    if getter is None:
+        return ""
+    try:
+        value = getter(index)
+    except Exception:
+        return ""
+    return str(value or "")
+
+def speed_mbit(value):
+    """Скорость порта в мегабитах, как бы демон её ни назвал.
+
+    TRex говорит гигабитами (40 - это 40G), но у разных релизов и сборок цифра
+    приезжала и мегабитами. Граница по 1000 разделяет их однозначно: порта на
+    1000 Гбит/с не бывает, а на 1000 Мбит/с бывает сплошь.
+    """
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    if number <= 0:
+        return 0
+    return number * 1000 if number < 1000 else number
+
+def port_rows(client, count):
+    """Линк, скорость, драйвер и владелец по каждому порту демона.
+
+    Порты не захватываются: опрос не имеет права испортить чужой прогон -
+    тот самый, чьего владельца он и показывает.
+    """
+    rows = []
+    for index in range(count):
+        attr = port_attr(client, index)
+        link = attr.get("link", attr.get("link_status", ""))
+        if isinstance(link, dict):
+            link = link.get("status", link.get("link", ""))
+        service = None
+        for key in ("service", "service_mode", "is_service_mode"):
+            if key in attr:
+                raw = attr[key]
+                service = (str(raw).strip().lower() in ("on", "true", "yes", "1")
+                           if isinstance(raw, str) else bool(raw))
+                break
+        rows.append({
+            "index": index,
+            "link": str(link or "").strip().lower(),
+            "speed_mbit": speed_mbit(attr.get("speed", 0)),
+            "driver": str(attr.get("driver", "") or ""),
+            "owner": owner_of(client, index, attr),
+            "state": str(attr.get("state", attr.get("status", "")) or ""),
+            "service": service,
+        })
+    return rows
 
 def trex_cfg_facts():
     """Что демон знает о себе сам: сколько у него портов и какая линия.
@@ -478,8 +624,23 @@ def inspect(transport: Transport, timeout: int = 30,
         trex_rpc_ports=int(payload.get("trex_rpc_ports") or 0),
         trex_ports=int(payload.get("trex_ports") or 0),
         trex_link_mbit=int(payload.get("trex_link_mbit") or 0),
+        trex_port_info=[_trex_port(d) for d in payload.get("trex_port_rows", [])
+                        if isinstance(d, dict)],
         has_ixnetwork=bool(payload.get("has_ixnetwork")),
         ixnetwork_version=str(payload.get("ixnetwork_version", "")),
+    )
+
+
+def _trex_port(d: dict[str, Any]) -> TrexPort:
+    service = d.get("service")
+    return TrexPort(
+        index=int(d.get("index", 0) or 0),
+        link=str(d.get("link", "") or "").strip().lower(),
+        speed_mbit=int(d.get("speed_mbit", 0) or 0),
+        driver=str(d.get("driver", "") or ""),
+        owner=str(d.get("owner", "") or ""),
+        state=str(d.get("state", "") or ""),
+        service=None if service is None else bool(service),
     )
 
 

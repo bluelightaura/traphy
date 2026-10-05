@@ -180,6 +180,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
             "has_scapy": info.has_scapy, "scapy_version": info.scapy_version,
             "is_root": info.is_root, "can_sudo": info.can_sudo,
             "ifaces": [vars(i) for i in info.ifaces],
+            # Порты генератора идут отдельным списком: это не интерфейсы
+            # хоста, их забрал DPDK, и спрашивать о них можно только демона.
+            "trex_ports": [vars(p) for p in info.trex_port_info],
         }, ensure_ascii=False, indent=2))
         return 0 if info.ok else 3
 
@@ -192,6 +195,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
                       "нет, sudo без пароля" if info.can_sudo else "нет"))
     for iface in info.usable_ifaces():
         print(f"  {iface.name:<16} {iface.describe()}")
+    # Порты генератора - то, по чему перед выездом на стенд видно, свободен ли
+    # он и поднят ли линк. В /sys/class/net этих карт нет вовсе.
+    for port in info.trex_port_info:
+        print(f"  {port.describe()}")
     # The target's own engine judges, not Scapy by default: telling a TRex
     # host it is missing Scapy and root is noise, and noise in this list is
     # how the real blocker underneath it gets skipped over.

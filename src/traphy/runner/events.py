@@ -65,6 +65,10 @@ def apply_events(result: RunResult, events: list[dict[str, Any]]) -> None:
             result.idle_rx = int(event.get("idle_rx", 0) or 0)
             result.idle_rx_groups = int(event.get("idle_rx_groups", 0) or 0)
             result.rx_foreign = int(event.get("rx_foreign", 0) or 0)
+            result.rx_per_group = {str(pg): dict(row) for pg, row
+                                   in (event.get("groups") or {}).items()}
+            result.flow_err_rx = int(event.get("flow_err_rx", 0) or 0)
+            result.flow_err_tx = int(event.get("flow_err_tx", 0) or 0)
             result.ordered_pkts = int(event.get("ordered", 0) or 0)
             result.link_down = bool(event.get("link_down", False))
             result.port_errors = dict(event.get("port_errors") or {})

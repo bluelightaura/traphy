@@ -460,7 +460,7 @@ def _fields(session: Session, d: Target) -> list[Field]:
         if err:
             return err
         d.trex_port_tx = n
-        return ""
+        return _trex_port_warning(session, n, "отправки")
 
     def trex_rx_set(v: str) -> str:
         """-1 is a real answer here: "nobody is counting the receive side"."""
@@ -474,7 +474,7 @@ def _fields(session: Session, d: Target) -> list[Field]:
         if n == d.trex_port_tx:
             return ("! тот же порт, что и отправка - счётчик поймает "
                     "собственную отправку, а не то, что вернулось")
-        return ""
+        return _trex_port_warning(session, n, "приёма")
 
     def ixia_api_set(v: str) -> str:
         d.ixia_api_host = v.strip()
@@ -604,16 +604,18 @@ def _fields(session: Session, d: Target) -> list[Field]:
               suggest=("127.0.0.1",)),
         Field("trex_sync", t("f_trex_sync"), lambda: str(d.trex_sync_port),
               trex_sync_set, visible=by_trex, suggest=("4501",)),
-        Field("trex_tx", t("f_trex_tx"), lambda: str(d.trex_port_tx),
-              trex_tx_set, visible=by_trex,
-              hint="индекс из trex_cfg.yaml, не имя карты - p спросит у демона",
-              suggest=("0", "1")),
+        Field("trex_tx", t("f_trex_tx"),
+              lambda: _trex_port_label(session, d.trex_port_tx),
+              trex_tx_set, visible=by_trex, raw=lambda: str(d.trex_port_tx),
+              hint=_trex_port_hint(session, "tx"),
+              suggest=_trex_port_suggest(session, "tx")),
         Field("trex_rx", t("f_trex_rx"),
-              lambda: (str(d.trex_port_rx) if d.trex_port_rx >= 0
-                       else t("trex_rx_unset")),
+              lambda: (_trex_port_label(session, d.trex_port_rx)
+                       if d.trex_port_rx >= 0 else t("trex_rx_unset")),
               trex_rx_set, visible=by_trex,
-              hint="«-» чтобы не мерить приём вовсе",
-              suggest=(("1", "обычно второй порт"), ("-", "не мерить приём"))),
+              raw=lambda: (str(d.trex_port_rx) if d.trex_port_rx >= 0 else "-"),
+              hint=_trex_port_hint(session, "rx"),
+              suggest=_trex_port_suggest(session, "rx")),
         Field("trex_force", t("f_trex_force"), lambda: _yn(d.trex_force),
               trex_force_toggle, kind="toggle", visible=by_trex,
               hint="выключено - занятый чужим прогоном порт не отбирается"),
@@ -690,6 +692,94 @@ def _assign(d: Target, which: str, value: str) -> None:
         d.tx_iface = value
     else:
         d.rx_iface = value
+
+
+def _trex_ports(session: Session) -> list:
+    """Порты генератора, как их описал демон при опросе. Пусто - не спрашивали."""
+    host = session.host
+    if not host or not host.ok:
+        return []
+    return list(host.trex_port_info)
+
+
+def _trex_port(session: Session, index: int):
+    return next((p for p in _trex_ports(session) if p.index == index), None)
+
+
+def _trex_port_label(session: Session, index: int) -> str:
+    """Номер порта и то, что про него сказал демон, когда его спрашивали.
+
+    Номер сам по себе не говорит ни о чём: у TRex это индекс в его
+    конфигурации, а не надпись на коробке. Линк и скорость рядом с ним - то, по
+    чему человек узнаёт, тот ли это порт, не выходя из формы.
+    """
+    found = _trex_port(session, index)
+    if found is None:
+        return str(index)
+    said = found.describe().split(" · ", 1)
+    return f"{index}  ({said[1]})" if len(said) > 1 else str(index)
+
+
+def _trex_port_suggest(session: Session, which: str):
+    """Список портов с самого демона; до опроса - обычные догадки.
+
+    Как и с интерфейсами: предлагать можно либо то, что сказала машина, либо
+    ничего. Выдуманный список портов на генераторе с одной картой - это совет
+    вбить номер, которого там нет.
+    """
+    def go() -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        if which == "rx":
+            out.append(("-", "не мерить приём"))
+        found = _trex_ports(session)
+        if found:
+            out += [(str(p.index), p.describe().split(" · ", 1)[-1])
+                    for p in found]
+            return out
+        out += [("0", "обычно первый порт")] if which == "tx" else \
+               [("1", "обычно второй порт")]
+        return out
+    return go
+
+
+def _trex_port_hint(session: Session, which: str):
+    def go() -> str:
+        found = _trex_ports(session)
+        if found:
+            free = sum(1 for p in found if p.free)
+            return f"с демона: портов {len(found)}, свободно {free}"
+        if which == "rx":
+            return "«-» чтобы не мерить приём вовсе"
+        return "индекс из trex_cfg.yaml, не имя карты - p спросит у демона"
+    return go
+
+
+def _trex_port_warning(session: Session, index: int, role: str) -> str:
+    """Сказать про порт сейчас, а не отказом посреди прогона.
+
+    Три вещи, каждая из которых иначе выясняется дорого: такого порта у демона
+    нет (номер - индекс, и на машине с одной картой «1» не существует), порт
+    держит чужой прогон, линк на нём опущен. Последнее особенно: прогон на
+    порту с упавшим линком возвращается как «потери 100%», и это ровно та
+    цифра, за которой идут проверять коробку.
+    """
+    found = _trex_ports(session)
+    if not found:
+        return ""
+    mine = next((p for p in found if p.index == index), None)
+    if mine is None:
+        return (f"! у демона всего {len(found)} порт(а) - порта {index} там "
+                f"нет; номер это индекс из trex_cfg.yaml")
+    if mine.owner:
+        return (f"! порт {index} держит {mine.owner} - прогон откажется, пока "
+                f"порт не отдадут; отобрать можно только явным «отбирать»")
+    if mine.link == "down":
+        return (f"! линк на порту {index} опущен - прогон {role} вернётся как "
+                f"«потери 100%», хотя описывает кабель")
+    if mine.service:
+        return (f"! порт {index} стоит в сервисном режиме - потолок скорости "
+                f"ниже обычного; обычно это остаток чужого прогона с записью")
+    return ""
 
 
 def _iface_warning(session: Session, d: Target, which: str) -> str:

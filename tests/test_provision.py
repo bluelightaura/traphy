@@ -648,3 +648,75 @@ def test_the_session_card_can_be_picked_in_af_packet():
              "mode": provision.AF_PACKET}
     screen._toggle(state, card)
     assert state["picked"] == [card.pci]
+
+
+# --- запись PCI: одна карта, два написания ------------------------------
+
+def test_short_pci_becomes_full():
+    """В trex_cfg.yaml пишут 01:00.0, sysfs зовёт ту же карту 0000:01:00.0."""
+    assert provision.normalize_pci("01:00.0") == "0000:01:00.0"
+    assert provision.normalize_pci("0000:01:00.0") == "0000:01:00.0"
+
+
+def test_quotes_and_spaces_do_not_make_it_another_card():
+    assert provision.normalize_pci("  '02:00.0' ") == "0000:02:00.0"
+    assert provision.normalize_pci("") == ""
+
+
+def test_card_is_found_by_either_spelling():
+    gen = generator(nics=[nic("0000:01:00.0", "eth1")])
+    assert gen.nic("01:00.0") is not None
+    assert gen.nic("0000:01:00.0") is not None
+
+
+def test_config_ports_are_read_in_the_short_form():
+    """Иначе выходит «в конфигурации портов нет», хотя они там есть."""
+    gen = provision.read_generator({
+        "ok": True, "cfg_ports": ["01:00.0", "02:00.0"], "nics": [],
+    })
+    assert gen.cfg_ports == ["0000:01:00.0", "0000:02:00.0"]
+
+
+def test_config_is_not_rewritten_when_it_matches_in_the_short_form():
+    """Совпадение не должно зависеть от того, как записан адрес."""
+    gen = generator(cfg_exists=True, cfg_ports=["0000:3b:00.0", "0000:3b:00.1"])
+    plan = provision.build_plan(gen, PORTS)
+    assert not any(s.key == "cfg" for s in plan.steps)
+
+
+# --- имя интерфейса: у virtio оно лежит глубже ---------------------------
+
+def _net_names():
+    """Достать функцию из удалённого скрипта и выполнить её здесь."""
+    import os as _os
+    import re
+    source = re.search(r"def net_names\(path\):.*?\n\n\ndef ", provision.SURVEY_SCRIPT,
+                       re.S).group(0).rsplit("\n\n\ndef ", 1)[0]
+    ns = {"os": _os}
+    exec("def listdir(path):\n"
+         "    try:\n        return sorted(os.listdir(path))\n"
+         "    except OSError:\n        return []\n" + source, ns)
+    return ns["net_names"]
+
+
+def test_interface_name_is_found_right_under_the_pci_device(tmp_path):
+    card = tmp_path / "0000:01:00.0"
+    (card / "net" / "eth1").mkdir(parents=True)
+    assert _net_names()(str(card)) == ["eth1"]
+
+
+def test_interface_name_is_found_one_level_deeper(tmp_path):
+    """У virtio сетевое устройство лежит под virtioN, а не прямо в каталоге.
+
+    Без этого карта управления оставалась безымянной - и защита «не отдавать
+    DPDK карту, через которую идёт сеанс» её не видела.
+    """
+    card = tmp_path / "0000:06:12.0"
+    (card / "virtio3" / "net" / "enp6s18").mkdir(parents=True)
+    assert _net_names()(str(card)) == ["enp6s18"]
+
+
+def test_a_card_taken_by_dpdk_has_no_name(tmp_path):
+    card = tmp_path / "0000:02:00.0"
+    card.mkdir()
+    assert _net_names()(str(card)) == []

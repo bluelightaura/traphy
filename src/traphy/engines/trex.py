@@ -226,9 +226,19 @@ class TrexEngine:
         version = f" {host.trex_version}" if host.trex_version else ""
         if not host.has_trex_stl:
             return f"{where}{version} - без control plane"
-        return f"TRex{version} в {where} · " + ("демон отвечает"
-                                                if host.trex_daemon
-                                                else "демон не поднят")
+        said = f"TRex{version} в {where} · " + ("демон отвечает"
+                                                 if host.trex_daemon
+                                                 else "демон не поднят")
+        # Сколько портов и сколько из них свободно - то, что определяет, пойдёт
+        # ли прогон вообще, и до этого видно не было нигде.
+        ports = host.trex_port_info
+        if ports:
+            free = sum(1 for p in ports if p.free)
+            said += f" · портов {len(ports)}, свободно {free}"
+            down = [p.index for p in ports if p.link == "down"]
+            if down:
+                said += " · линк опущен: " + ", ".join(str(i) for i in down)
+        return said
 
     def describe_result(self, event: dict[str, Any]) -> str:
         return RX_SOURCES.get(str(event.get("rx_source", "")), "")
