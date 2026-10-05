@@ -52,7 +52,7 @@ LINE = "ЛИНИЯ"
 KEYS = "↑/↓ ↵ править  c связь  t цели  p спросить  s сохранить  q отмена"
 
 SECTIONS = {
-    "use_ssh": SEND, "host": SEND, "ssh_user": SEND, "ssh_port": SEND,
+    "use_ssh": SEND, "transport": SEND, "host": SEND, "ssh_user": SEND, "ssh_port": SEND,
     "ssh_key": SEND, "ssh_password": SEND, "strict": SEND,
     "fingerprint": SEND, "python": SEND, "sudo": SEND,
 
@@ -375,6 +375,14 @@ def _fields(session: Session, d: Target) -> list[Field]:
             return t("pw_env")
         return t("pw_set")
 
+    def transport_set(v: str) -> str:
+        """SSH или telnet. telnet несёт пароль открытым текстом - об этом прямо."""
+        d.transport = "telnet" if v == "telnet" else "ssh"
+        session.disconnect()
+        if d.transport == "telnet":
+            return "! telnet: логин и пароль пойдут открытым текстом по сети"
+        return ""
+
     def where_set(v: str) -> str:
         want = v == "ssh"
         if want != d.use_ssh:
@@ -551,6 +559,14 @@ def _fields(session: Session, d: Target) -> list[Field]:
               where_set, kind="pick", raw=lambda: "ssh" if d.use_ssh else "local",
               options=[("local", t("w_local"), t("w_local_hint")),
                        ("ssh", t("w_ssh"), t("w_ssh_hint"))]),
+        # Чем добираемся: SSH по умолчанию, telnet - запасной для машин, где
+        # поднят только telnetd. Виден лишь на удалённой цели.
+        Field("transport", t("f_transport"),
+              lambda: t("w_telnet") if d.transport == "telnet" else t("w_ssh2"),
+              transport_set, kind="pick", visible=remote,
+              raw=lambda: d.transport,
+              options=[("ssh", t("w_ssh2"), t("w_ssh2_hint")),
+                       ("telnet", t("w_telnet"), t("w_telnet_hint"))]),
         Field("host", t("f_host"), lambda: d.host or t("unset"), host_set,
               visible=remote, raw=lambda: d.host),
         Field("ssh_user", t("f_ssh_user"), lambda: d.ssh_user or t("unset"),

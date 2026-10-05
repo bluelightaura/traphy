@@ -23,6 +23,7 @@ import contextlib
 import errno
 import hashlib
 import os
+import re
 import select
 import shlex
 # Running a script on another machine is the whole feature; the shell-out is
@@ -66,6 +67,9 @@ DEFAULT_HOST_KEY_MODE = "strict"
 # коллеге и кладёт в заметки, а аргумент виден в ps на общей машине.
 SSH_PASSWORD_ENV = "TRAPHY_SSH_PASSWORD"  # nosec B105
 SUDO_PASSWORD_ENV = "TRAPHY_SUDO_PASSWORD"  # nosec B105
+# Пароль telnet - отдельной переменной. telnet несёт его открытым текстом, и
+# путать с паролем SSH, который уходит зашифрованным, нельзя.
+TELNET_PASSWORD_ENV = "TRAPHY_TELNET_PASSWORD"  # nosec B105
 
 
 def ssh_password() -> str:
@@ -76,6 +80,11 @@ def ssh_password() -> str:
 def sudo_password() -> str:
     """Пароль sudo на цели из окружения, если он там есть."""
     return os.environ.get(SUDO_PASSWORD_ENV, "")
+
+
+def telnet_password() -> str:
+    """Пароль telnet из окружения. Открытым текстом по сети - см. транспорт."""
+    return os.environ.get(TELNET_PASSWORD_ENV, "")
 
 
 def known_hosts_path() -> Path:
@@ -475,6 +484,200 @@ class SshTransport(Transport):
             self._client.close()
 
 
+# Байты протокола telnet. Нужны не ради поддержки опций, а чтобы вынуть их из
+# потока: сервер шлёт переговоры об опциях вперемешку с текстом, и без разбора
+# они попадали бы в вывод как мусор.
+_IAC, _DONT, _DO, _WONT, _WILL, _SB, _SE = (255, 254, 253, 252, 251, 250, 240)
+
+
+def _telnet_filter(data: bytes, sock) -> bytes:
+    """Выкинуть переговоры об опциях, на каждое предложение ответив отказом.
+
+    Минимальный, но корректный клиент: опции мы не поддерживаем ни одной, и на
+    любое DO/WILL отвечаем WONT/DONT. Этого хватает для строчного режима, в
+    котором работает консоль, и ничем не грозит: сервер просто остаётся при
+    своих умолчаниях.
+    """
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        if byte != _IAC:
+            out.append(byte)
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        cmd = data[i + 1]
+        if cmd in (_DO, _DONT, _WILL, _WONT) and i + 2 < len(data):
+            opt = data[i + 2]
+            answer = _WONT if cmd in (_DO, _DONT) else _DONT
+            with contextlib.suppress(OSError):
+                sock.sendall(bytes([_IAC, answer, opt]))
+            i += 3
+        elif cmd == _SB:                      # подпереговоры - до IAC SE
+            end = data.find(bytes([_IAC, _SE]), i)
+            i = end + 2 if end != -1 else len(data)
+        else:
+            i += 2
+    return bytes(out)
+
+
+class TelnetTransport(Transport):
+    """Отправляющая машина доступна только по telnet.
+
+    Это запасной вход, а не равноправный. Весь смысл в одной фразе: telnet
+    передаёт логин и пароль открытым текстом, их видит любой на пути. Поэтому
+    он здесь ради лабораторных генераторов, на которых поднят один telnetd и
+    добраться иначе нельзя, - и ни для чего больше. Где есть SSH, берётся SSH.
+
+    Логинится в интерактивную оболочку, прогоняет тот же base64-свёрток, что и
+    SSH, и ловит конец по маркеру с кодом возврата: у telnet нет отдельного
+    канала статуса, как у SSH, - только то, что команда сама напечатает.
+    """
+
+    _CTRL_C = b"\x03"
+
+    def __init__(self, host: str, user: str, port: int = 23,
+                 password: str = "", python: str = "python3",  # nosec B107
+                 prompt: str = r"[$#>]\s*$", connect_timeout: int = 10):
+        import socket as _socket
+
+        self.host, self.user, self.port = host, user, port
+        self.python = python
+        self._prompt = re.compile(prompt.encode() if isinstance(prompt, str)
+                                  else prompt)
+        try:
+            self._sock = _socket.create_connection((host, port),
+                                                   timeout=connect_timeout)
+        except OSError as exc:
+            raise TransportError(f"{host}:{port} недоступен по telnet - {exc}") from exc
+        self._sock.settimeout(1.0)
+        try:
+            self._login(user, password)
+        except TransportError:
+            self.close()
+            raise
+
+    def _read_until(self, pattern, timeout: float) -> bytes:
+        """Читать, вычищая опции telnet, пока не совпадёт образец или таймаут."""
+        rx = pattern if hasattr(pattern, "search") else re.compile(pattern, re.I)
+        buf, deadline = bytearray(), time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._sock.recv(4096)
+            except TimeoutError:
+                if rx.search(bytes(buf)):
+                    return bytes(buf)
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += _telnet_filter(chunk, self._sock)
+            if rx.search(bytes(buf)):
+                return bytes(buf)
+        return bytes(buf)
+
+    def _send(self, line: str) -> None:
+        with contextlib.suppress(OSError):
+            self._sock.sendall(line.encode() + b"\r")
+
+    def _login(self, user: str, password: str) -> None:
+        # Консоль могла остаться в середине чужого недовведённого логина -
+        # сбросить ввод и дождаться чистого приглашения, а не лить поверх.
+        with contextlib.suppress(OSError):
+            self._sock.sendall(self._CTRL_C)
+        self._send("")
+        greet = self._read_until(rb"(login|username|password)\s*:\s*$|" +
+                                 self._prompt.pattern, 10)
+        if self._prompt.search(greet):
+            return                             # уже в оболочке (без логина)
+        if re.search(rb"(login|username)\s*:", greet, re.I):
+            self._send(user)
+            self._read_until(rb"password\s*:", 8)
+            self._send(password)
+        elif re.search(rb"password\s*:", greet, re.I):
+            self._send(password)
+        after = self._read_until(self._prompt.pattern +
+                                 rb"|(incorrect|denied|bad password|failed)", 12)
+        if re.search(rb"(incorrect|denied|bad password|failed|no such)", after, re.I):
+            raise TransportError(
+                f"{user}@{self.host}: логин по telnet не принят - проверь имя, "
+                f"пароль (переменная {TELNET_PASSWORD_ENV}) и что это та машина")
+        if not self._prompt.search(after):
+            raise TransportError(
+                f"{user}@{self.host}: приглашение оболочки не пришло - "
+                f"возможно, консоль занята другим сеансом")
+
+    def describe(self) -> str:
+        return f"telnet {self.user}@{self.host}:{self.port} (открытый текст!)"
+
+    def run_stream(self, script: str, args: list[str], on_line: LineCB,
+                   timeout: int = DEFAULT_TIMEOUT, sudo: bool = False,
+                   secret: str = "") -> Completed:  # nosec B107
+        cmd = _wrap(script, args, self.python, sudo, secret)
+        # У telnet нет канала кода возврата - обрамляем вывод маркерами сами:
+        # начало, чтобы отрезать эхо самой команды, и конец с $? в нём.
+        start, end = "__TRX_B__", "__TRX_E__"
+        self._send(f"echo {start}; {cmd}; echo {end}$?{end}")
+
+        # sudo -S читает пароль со stdin, а stdin здесь - тот же tty: шлём его
+        # следующей строкой. Над открытым каналом это, конечно, не секрет.
+        if secret:
+            time.sleep(0.3)
+            self._send(secret)
+
+        tail = re.compile(re.escape(end).encode() + rb"(\d+)" + re.escape(end).encode())
+        raw = self._read_until(tail, timeout)
+        match = tail.search(raw)
+        if match is None:
+            raise TransportError(
+                f"{self.host}: команда не завершилась за {timeout} c по telnet")
+        rc = int(match.group(1))
+
+        text = raw.decode("utf-8", "replace")
+        body = text.split(start, 1)[-1].split(end, 1)[0]
+        lines = [ln.rstrip("\r") for ln in body.splitlines()]
+        # Первая строка - эхо «echo __TRX_B__» с остатком команды; её не отдаём.
+        collected = []
+        for ln in lines:
+            if start in ln or ln.strip() == "":
+                continue
+            collected.append(ln)
+            on_line(ln)
+        return Completed(rc, "\n".join(collected), "")
+
+    def fetch(self, remote_path: str, local_path: Path) -> bool:
+        """Забрать файл через base64 по той же оболочке - SFTP у telnet нет."""
+        marker = "__TRX_F__"
+        self._send(f"echo {marker}; base64 {shlex.quote(remote_path)} 2>/dev/null; "
+                   f"echo {marker}")
+        raw = self._read_until(re.escape(marker).encode() + rb".*" +
+                               re.escape(marker).encode(), 60)
+        text = raw.decode("utf-8", "replace")
+        parts = text.split(marker)
+        if len(parts) < 3:
+            return False
+        blob = "".join(parts[1].split())
+        try:
+            data = base64.b64decode(blob, validate=False)
+        except (ValueError, TypeError):       # мусор вместо base64 = нет файла
+            return False
+        if not data:
+            return False
+        try:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(data)
+        except OSError:
+            return False
+        return True
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._sock.close()
+
+
 def _ssh_hint(host: str, user: str, exc: Exception,
               mode: str = DEFAULT_HOST_KEY_MODE) -> str:
     """Turn paramiko's host-key refusal into something actionable.
@@ -502,6 +705,10 @@ def open_transport(target, password: str = "") -> Transport:  # nosec B107
     """
     if target.is_local:
         return LocalTransport(python=local_python(target.python))
+    if getattr(target, "transport", "ssh") == "telnet":
+        return TelnetTransport(
+            host=target.host, user=target.ssh_user, port=target.ssh_port,
+            password=password or telnet_password(), python=target.python)
     return SshTransport(
         host=target.host, user=target.ssh_user, port=target.ssh_port,
         key_filename=str(Path(target.ssh_key).expanduser()) if target.ssh_key else "",

@@ -98,6 +98,12 @@ class Target:
     engine: str = "scapy"
 
     use_ssh: bool = False
+    # Чем добираемся до удалённой машины. ssh - по умолчанию и всегда, когда
+    # есть выбор: telnet несёт логин и пароль открытым текстом. telnet здесь
+    # ради лабораторных генераторов, на которых поднят только telnetd, - не
+    # потому, что так стоит делать, а потому, что иначе до такой машины не
+    # добраться вовсе. При use_ssh=False не значит ничего: цель локальная.
+    transport: str = "ssh"
     host: str = "127.0.0.1"
     ssh_user: str = ""
     ssh_port: int = 22
@@ -267,6 +273,7 @@ class Target:
             description=str(d.get("description", "")),
             engine=str(d.get("engine", "scapy")),
             use_ssh=bool(d.get("use_ssh", False)),
+            transport=str(d.get("transport", "ssh")) or "ssh",
             host=str(d.get("host", "127.0.0.1")),
             ssh_user=str(d.get("ssh_user", "")),
             ssh_port=int(d.get("ssh_port", 22)),

@@ -169,6 +169,12 @@ S: dict[str, dict[str, str]] = {
     "w_local_hint": {"ru": "кадры летят с карты этого компьютера",
                      "en": "frames leave this computer's own NIC"},
     "w_ssh": {"ru": "с другой машины по SSH", "en": "from another machine over SSH"},
+    "f_transport": {"ru": "как добираемся", "en": "transport"},
+    "w_ssh2": {"ru": "SSH", "en": "SSH"},
+    "w_ssh2_hint": {"ru": "зашифровано; обычный выбор", "en": "encrypted; the usual choice"},
+    "w_telnet": {"ru": "telnet", "en": "telnet"},
+    "w_telnet_hint": {"ru": "логин и пароль ОТКРЫТЫМ ТЕКСТОМ - только если SSH нет",
+                      "en": "login and password IN CLEARTEXT - only if there is no SSH"},
     "w_ssh_hint": {"ru": "скрипт уезжает туда, кадры летят с её карты",
                    "en": "the script ships there and sends from its NIC"},
     # Выборка значения поля: обычное, вводившееся раньше, и ручной ввод.
