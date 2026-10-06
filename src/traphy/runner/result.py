@@ -215,6 +215,25 @@ class RunResult:
         """Можно ли предъявлять этот прогон как результат."""
         return self.measured() and not self.disqualified()
 
+    def stand_silent(self) -> bool:
+        """Со стенда не вернулось почти ничего, хотя послали заметный объём.
+
+        Это другой случай, чем «наш счётчик врёт»: там, где назад пришла
+        пара кадров из десятков тысяч, виноват не замер, а путь через
+        устройство - и человеку надо сказать именно это, а не «два счётчика
+        разошлись». Порог высокий нарочно: 99% потерь на боевом железе бывают,
+        50% - это уже про настройку стенда, а не про отказ.
+        """
+        return (bool(self.disqualified()) and self.loss_countable
+                and self.tx_pkts >= 100 and self.loss_pct >= 99.0)
+
+    def _verdict(self) -> str:
+        """Заголовок негодного прогона - словами той беды, что случилась."""
+        if self.stand_silent():
+            return (f"СТЕНД НЕ ОТВЕЧАЕТ: назад пришло {self.rx_pkts} из "
+                    f"{self.tx_pkts} - проверь путь через устройство")
+        return f"ЗАМЕР НЕ ГОДИТСЯ: {self.disqualified()[0]}"
+
     def summary(self) -> str:
         """One line for the menu's history and for the run screen's footer."""
         if self.dry_run:
@@ -229,8 +248,7 @@ class RunResult:
             # и аккуратный ноль тут - самое неверное, что можно напечатать.
             lost = (f"потери {self.loss_pct:.2f}%" if self.loss_countable
                     else "потери не считаются")
-            return (f"{head} · rx={self.rx_pkts} · {lost} "
-                    f"· ЗАМЕР НЕ ГОДИТСЯ: {self.disqualified()[0]}")
+            return f"{head} · rx={self.rx_pkts} · {lost} · {self._verdict()}"
         if self.rx_source == "none":
             return f"{head} · приём не измерялся"
         if self.rx_pkts > self.tx_pkts:
@@ -248,8 +266,7 @@ class RunResult:
         # «Приблизительно» и «негоден как замер» - разные вещи, и вторую в
         # одну строку истории раньше не выносило ничто: прогон со слепыми
         # группами выглядел там так же, как честный приблизительный.
-        why = self.disqualified()
-        return f"{said} · ЗАМЕР НЕ ГОДИТСЯ: {why[0]}" if why else said
+        return f"{said} · {self._verdict()}" if self.disqualified() else said
 
     def warnings(self) -> list[str]:
         """Everything about this result a reader should not have to infer."""

@@ -249,9 +249,10 @@ def test_blind_groups_contradicted_by_the_port_are_not_a_measurement():
     assert result.disqualified(), "противоречие счётчиков обязано быть названо"
     assert result.loss_countable and round(result.loss_pct, 2) == 99.99
     assert result.to_dict()["measurement_valid"] is False
-    # И в одну строку истории это тоже обязано попасть: иначе прогон со
-    # слепыми группами выглядит там как честный приблизительный.
-    assert "ЗАМЕР НЕ ГОДИТСЯ" in result.summary()
+    # tx 50001, назад 5 - это не «наш счётчик врёт», это стенд не вернул
+    # трафик, и в строке истории так и сказано, словами пути, а не счётчиков.
+    assert "СТЕНД НЕ ОТВЕЧАЕТ" in result.summary()
+    assert result.stand_silent()
 
 
 def test_a_zero_nothing_could_contradict_is_not_a_measurement_either():
@@ -270,3 +271,27 @@ def test_a_port_counter_on_its_own_stays_a_measurement():
                        rx_source="port_counter", reliable=False)
     assert result.valid_measurement() is True
     assert "ЗАМЕР НЕ ГОДИТСЯ" not in result.summary()
+
+
+def test_a_generator_shortfall_is_not_blamed_on_the_stand():
+    """Трафик вернулся, но генератор недобрал заданное - виноват генератор,
+    и вердикт это и говорит, а не валит на стенд."""
+    result = RunResult(engine="trex", tx_pkts=5000, rx_pkts=4800,
+                       rx_source="flow_stats_blind", reliable=False,
+                       seconds=5.0, achieved_pps=1000.0, ordered_pkts=50000)
+    assert result.stand_silent() is False
+    said = result.summary()
+    assert "ЗАМЕР НЕ ГОДИТСЯ" in said
+    assert "СТЕНД НЕ ОТВЕЧАЕТ" not in said
+
+
+def test_the_stand_is_called_silent_only_when_almost_nothing_returned():
+    """Порог высокий: 99% потерь - про путь, 50% - про настройку, не про отказ."""
+    half = RunResult(engine="trex", tx_pkts=10000, rx_pkts=5000,
+                     rx_source="flow_stats_blind", reliable=False,
+                     seconds=1.0, achieved_pps=10000.0)
+    assert half.stand_silent() is False
+    almost_none = RunResult(engine="trex", tx_pkts=10000, rx_pkts=3,
+                            rx_source="flow_stats_blind", reliable=False,
+                            seconds=1.0, achieved_pps=10000.0)
+    assert almost_none.stand_silent() is True
